@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(streamlit run:*)",
+      "Bash(timeout:*)",
+      "Bash(dir /b \"c:\\\\Users\\\\SamHilton\\\\Desktop\\\\Production_Planning\\\\*.py\")",
+      "Bash(ls:*)",
+      "Bash(sort:*)",
+      "Bash(del \"c:\\\\Users\\\\SamHilton\\\\Desktop\\\\Production_Planning\\\\prediction_utils.py\")",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\SamHilton\\\\Desktop\\\\Production_Planning\" -Filter \"*.py\" -Depth 0)",
+      "Bash(Select-Object Name)",
+      "Bash(git config:*)",
+      "Bash(.venvScriptspip list)",
+      "Bash(findstr:*)",
+      "Bash(.venv/Scripts/pip.exe:*)",
+      "Bash(.venv/Scripts/python.exe -m pip:*)",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(conda install:*)",
+      "Bash(conda env list:*)",
+      "Bash(git add:*)",
+      "Bash(git rev-list:*)",
+      "Bash(git fsck:*)",
+      "Bash(git for-each-ref:*)",
+      "Bash(git gc:*)",
+      "Bash(git rm:*)"
+    ]
+  }
+}

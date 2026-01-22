@@ -1,0 +1,25 @@
+[server]
+# Server configuration for SAP BTP deployment
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+
+# Port will be set by $PORT environment variable in BTP
+# port = 8080
+
+[browser]
+# Disable usage statistics in production
+gatherUsageStats = false
+
+[theme]
+# Optional: Custom theme for SAP look and feel
+primaryColor = "#0070F2"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F5F5"
+textColor = "#333333"
+font = "sans serif"
+
+[client]
+# Show error details (set to false in production if needed)
+showErrorDetails = true
+toolbarMode = "minimal"

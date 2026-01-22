@@ -1,0 +1,83 @@
+# Cloud Foundry Ignore File
+# Files and directories to exclude from deployment
+
+# Windows reserved filenames (prevent deployment errors)
+nul
+NUL
+con
+CON
+aux
+AUX
+prn
+PRN
+
+# Python virtual environments (MUST be excluded - very large)
+.conda
+.conda/
+.conda/**
+**/.conda/
+.venv
+.venv/
+.venv/**
+venv/
+env/
+ENV/
+.env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Git
+.git/
+.gitignore
+
+# Test files
+tests/
+test_*.py
+*_test.py
+pytest_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Development files
+*.log
+*.tmp
+*.bak
+
+# Large data files (excluded to save memory - model is already trained)
+# Keep only small reference files
+101.csv
+261.csv
+
+# Model files that will be regenerated
+# Uncomment if you want to train fresh on deployment
+# *.joblib

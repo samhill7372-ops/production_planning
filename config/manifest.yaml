@@ -1,0 +1,43 @@
+---
+applications:
+  - name: production-planning-yield
+    # Memory allocation (Streamlit + ML models + large CSVs need adequate memory)
+    memory: 2048M
+    disk_quota: 4G
+
+    # Python buildpack for Cloud Foundry
+    buildpacks:
+      - python_buildpack
+
+    # Start command (defined in Procfile, but can also be here)
+    command: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false
+
+    # Health check configuration
+    health-check-type: http
+    health-check-http-endpoint: /_stcore/health
+    timeout: 180
+
+    # Environment variables
+    env:
+      # Streamlit configuration
+      STREAMLIT_SERVER_PORT: 8080
+      STREAMLIT_SERVER_HEADLESS: true
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: false
+
+      # Python configuration
+      PYTHONUNBUFFERED: 1
+
+      # Disable Streamlit's local file watcher (not needed in production)
+      STREAMLIT_SERVER_FILE_WATCHER_TYPE: none
+
+    # Random route to avoid conflicts (change for production)
+    random-route: true
+
+    # Number of instances
+    instances: 1
+
+# Notes for deployment:
+# 1. Login to CF: cf login -a <api-endpoint> -o <org> -s <space>
+# 2. Push app: cf push
+# 3. Check logs: cf logs production-planning-yield --recent
+# 4. Scale if needed: cf scale production-planning-yield -m 2G -i 2
