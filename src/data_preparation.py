@@ -19,14 +19,51 @@ import os
 warnings.filterwarnings('ignore')
 
 # Get the project root directory (parent of src/)
+import re
+import glob
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
 
 
+def get_available_years() -> List[str]:
+    """
+    Scan data directory for year-specific CSV files.
+
+    Looks for files matching patterns:
+    - 101_YYYY.csv (output data)
+    - 261_YYYY.csv (input data)
+
+    Returns list of years where BOTH 101 and 261 files exist.
+    """
+    years_101 = set()
+    years_261 = set()
+
+    # Pattern to extract year from filename
+    year_pattern = re.compile(r'(101|261)_(\d{4})\.csv$', re.IGNORECASE)
+
+    # Scan data directory
+    for filepath in glob.glob(os.path.join(DATA_DIR, "*.csv")):
+        filename = os.path.basename(filepath)
+        match = year_pattern.match(filename)
+        if match:
+            file_type = match.group(1)
+            year = match.group(2)
+            if file_type == '101':
+                years_101.add(year)
+            elif file_type == '261':
+                years_261.add(year)
+
+    # Return years where both files exist
+    common_years = years_101.intersection(years_261)
+    return sorted(list(common_years))
+
+
 def load_csv_files(
     input_261_path: str = None,
-    output_101_path: str = None
+    output_101_path: str = None,
+    years: List[str] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load the 261 (input material) and 101 (output material) CSV files.
@@ -34,8 +71,52 @@ def load_csv_files(
     SAP Logic:
     - 261.csv contains raw material INPUT consumption records (Goods Issue - material CONSUMED from stock)
     - 101.csv contains finished/semi-finished OUTPUT production records (Goods Receipt - material RECEIVED into stock)
+
+    Args:
+        input_261_path: Path to 261 CSV (used if years is None)
+        output_101_path: Path to 101 CSV (used if years is None)
+        years: List of years to load (e.g., ['2024', '2025']). If provided, loads year-specific files.
+
+    Returns:
+        Tuple of (df_261, df_101) DataFrames
     """
-    # Use default paths if not provided
+    # If years specified, load year-specific files
+    if years is not None and len(years) > 0:
+        df_261_list = []
+        df_101_list = []
+
+        for year in years:
+            path_261 = os.path.join(DATA_DIR, f"261_{year}.csv")
+            path_101 = os.path.join(DATA_DIR, f"101_{year}.csv")
+
+            if os.path.exists(path_261):
+                df = pd.read_csv(path_261)
+                df['_source_year'] = year  # Track source year
+                df_261_list.append(df)
+                print(f"Loaded 261_{year}.csv (INPUT): {len(df):,} rows")
+            else:
+                print(f"WARNING: 261_{year}.csv not found")
+
+            if os.path.exists(path_101):
+                df = pd.read_csv(path_101)
+                df['_source_year'] = year  # Track source year
+                df_101_list.append(df)
+                print(f"Loaded 101_{year}.csv (OUTPUT): {len(df):,} rows")
+            else:
+                print(f"WARNING: 101_{year}.csv not found")
+
+        if not df_261_list or not df_101_list:
+            raise ValueError(f"Could not load data for years: {years}")
+
+        df_261 = pd.concat(df_261_list, ignore_index=True)
+        df_101 = pd.concat(df_101_list, ignore_index=True)
+
+        print(f"Combined 261 (INPUT - Goods Issue): {len(df_261):,} rows from {len(df_261_list)} year(s)")
+        print(f"Combined 101 (OUTPUT - Goods Receipt): {len(df_101):,} rows from {len(df_101_list)} year(s)")
+
+        return df_261, df_101
+
+    # Fallback: Use default paths if not provided
     if input_261_path is None:
         input_261_path = os.path.join(DATA_DIR, "261.csv")
     if output_101_path is None:
@@ -63,6 +144,13 @@ def clean_dataframe(df: pd.DataFrame, df_name: str) -> pd.DataFrame:
     if 'MANUFACTURINGORDER' in df.columns:
         df['MANUFACTURINGORDER'] = df['MANUFACTURINGORDER'].astype(str).str.strip()
 
+    # Convert numeric columns to proper types (handle empty strings)
+    numeric_columns = ['MATERIALTHICKNESS', 'TALLYLENGTH', 'TALLYWIDTH', 'BFIN', 'BFOUT']
+    for col in numeric_columns:
+        if col in df.columns:
+            # Convert to numeric, coercing errors (empty strings, etc.) to NaN
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
     # Remove deleted records if flag exists
     if 'IS_DELETED' in df.columns:
         before = len(df)
@@ -77,20 +165,25 @@ def derive_bfout_from_dimensions(df_101: pd.DataFrame) -> pd.DataFrame:
     """
     Derive BFOUT (output board feet) from 101 data (Goods Receipt).
 
-    Formula: BFOUT = (MATERIALTHICKNESS × TALLYWIDTH × TALLYLENGTH) / 144
-    All units are in inches.
+    Priority order:
+    1. Use existing BFOUT column if it has valid values
+    2. Use BFIN column if it has values (some SAP configs store output in BFIN)
+    3. Derive from dimensions: (MATERIALTHICKNESS × TALLYWIDTH × TALLYLENGTH) / 144
 
     101 = Goods Receipt = finished goods RECEIVED into stock (OUTPUT)
     """
     df = df_101.copy()
 
-    # Check if we need to derive BFOUT or if it's already in BFIN column
-    if 'BFIN' in df.columns and df['BFIN'].sum() > 0:
-        # In 101 movement, BFIN column contains the board feet received
+    # Priority 1: Check if BFOUT column already exists with valid values
+    if 'BFOUT' in df.columns and df['BFOUT'].sum() > 0:
+        df['BFOUT'] = df['BFOUT'].fillna(0)
+        print("Using existing BFOUT column for 101 data (Goods Receipt)")
+    # Priority 2: Check if BFIN has values (some SAP configs use BFIN for output)
+    elif 'BFIN' in df.columns and df['BFIN'].sum() > 0:
         df['BFOUT'] = df['BFIN'].fillna(0)
         print("Using BFIN column as BFOUT for 101 data (Goods Receipt)")
+    # Priority 3: Derive from dimensions
     elif all(col in df.columns for col in ['MATERIALTHICKNESS', 'TALLYWIDTH', 'TALLYLENGTH']):
-        # Derive BFOUT from dimensions
         df['BFOUT'] = (
             df['MATERIALTHICKNESS'].fillna(0) *
             df['TALLYWIDTH'].fillna(0) *
@@ -98,12 +191,12 @@ def derive_bfout_from_dimensions(df_101: pd.DataFrame) -> pd.DataFrame:
         ) / 144
         print("Derived BFOUT from dimensions: (Thickness × Width × Length) / 144")
     else:
-        raise ValueError("Cannot derive BFOUT: Missing required columns")
+        raise ValueError("Cannot derive BFOUT: Missing required columns (BFOUT, BFIN, or dimension columns)")
 
     # Ensure non-negative
     df['BFOUT'] = df['BFOUT'].clip(lower=0)
 
-    print(f"BFOUT derived: Mean={df['BFOUT'].mean():.2f}, Total={df['BFOUT'].sum():,.0f}")
+    print(f"BFOUT: Mean={df['BFOUT'].mean():.2f}, Total={df['BFOUT'].sum():,.0f}")
     return df
 
 
@@ -488,7 +581,8 @@ def get_historical_yield_by_material(
 def prepare_full_dataset(
     input_261_path: str = None,
     output_101_path: str = None,
-    remove_yield_outliers: bool = True
+    remove_yield_outliers: bool = True,
+    years: List[str] = None
 ) -> Tuple[pd.DataFrame, Dict[str, LabelEncoder]]:
     """
     Complete data preparation pipeline following SAP logic.
@@ -505,7 +599,9 @@ def prepare_full_dataset(
 
     # Step 1: Load CSV files
     print("\n[1] Loading CSV files...")
-    df_261, df_101 = load_csv_files(input_261_path, output_101_path)
+    if years:
+        print(f"Loading data for years: {years}")
+    df_261, df_101 = load_csv_files(input_261_path, output_101_path, years=years)
 
     # Step 2: Clean dataframes
     print("\n[2] Cleaning dataframes...")

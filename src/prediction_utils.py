@@ -841,7 +841,10 @@ def simulate_output_materials_enhanced(
 
             # Recommendation
             'Recommendation_Score': round(recommendation_score, 4),
-            'Model_Type': 'Multi-Input' if len(input_materials) > 1 else 'Single-Input'
+            'Model_Type': 'Multi-Input' if len(input_materials) > 1 else 'Single-Input',
+
+            # Model performance
+            'Model_R2': round(best_r2, 4)
         })
 
     if len(results) == 0:
@@ -903,6 +906,9 @@ def get_top_recommendation(
         'risk_level': top['Risk_Level'],
         'historical_orders': top['Historical_Orders'],
         'recommendation_score': top['Recommendation_Score'],
+        'yield_std': top.get('Yield_Std', 0),
+        'model_r2': top.get('Model_R2', 0.3),
+        'historical_yield': top.get('Historical_Yield_Pct', 0),
         'message': f"Based on {top['Historical_Orders']} historical orders, "
                    f"producing {top['Output_Material']} has a {top['Confidence_Level']} confidence level "
                    f"with expected yield of {top['Predicted_Yield_Pct']:.1f}%."

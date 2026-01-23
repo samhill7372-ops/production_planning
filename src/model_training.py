@@ -793,8 +793,11 @@ class YieldPredictionModel:
                 rows.append(row)
         return pd.DataFrame(rows).sort_values('Test R²', ascending=False)
 
-    def save(self, path: str = "."):
-        """Save all model artifacts."""
+    def save(self, path: str = ".", years: List[str] = None):
+        """Save all model artifacts including year metadata."""
+        import json
+        from datetime import datetime
+
         os.makedirs(path, exist_ok=True)
 
         joblib.dump(self.best_model, os.path.join(path, 'yield_model.joblib'))
@@ -815,7 +818,26 @@ class YieldPredictionModel:
         if len(importance) > 0:
             importance.to_csv(os.path.join(path, 'feature_importance.csv'), index=False)
 
+        # Save model metadata including training years
+        best_metrics = self.metrics.get(self.best_model_name, {})
+        metadata = {
+            'trained_years': years if years else [],
+            'trained_at': datetime.now().isoformat(),
+            'best_model': self.best_model_name,
+            'test_r2': best_metrics.get('test_r2', 0),
+            'test_rmse': best_metrics.get('RMSE', 0),
+            'test_mae': best_metrics.get('MAE', 0),
+            'num_features': len(self.feature_columns),
+            'feature_columns': self.feature_columns
+        }
+
+        metadata_path = os.path.join(path, 'model_metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
         print(f"Model artifacts saved to: {path}")
+        if years:
+            print(f"Model trained on years: {', '.join(years)}")
 
     def load(self, path: str = "."):
         """Load model artifacts."""
@@ -857,12 +879,22 @@ class YieldPredictionModel:
 def train_yield_model(
     df: pd.DataFrame,
     encoders: Dict,
-    save_path: str = None
+    save_path: str = None,
+    years: List[str] = None
 ) -> YieldPredictionModel:
     """
     Complete training pipeline.
 
     Trains models to predict Yield_Percentage based on input material features.
+
+    Args:
+        df: Prepared dataset with features and target
+        encoders: Dictionary of LabelEncoders for categorical features
+        save_path: Directory to save model artifacts
+        years: List of years the data came from (for metadata)
+
+    Returns:
+        Trained YieldPredictionModel
     """
     # Use default models directory if not provided
     if save_path is None:
@@ -888,8 +920,8 @@ def train_yield_model(
     model.encoders = encoders
     model.train(df, feature_columns, target_column='Yield_Percentage')
 
-    # Save
-    model.save(save_path)
+    # Save with year metadata
+    model.save(save_path, years=years)
 
     return model
 

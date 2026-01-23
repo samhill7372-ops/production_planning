@@ -74,9 +74,15 @@ docs/
 *.bak
 
 # Large data files (excluded to save memory - model is already trained)
-# Keep only small reference files
-101.csv
-261.csv
+# Keep only small reference files in config/
+data/101.csv
+data/261.csv
+data/101_2024.csv
+data/261_2024.csv
+data/101_2025.csv
+data/261_2025.csv
+data/*_2024.csv
+data/*_2025.csv
 
 # Model files that will be regenerated
 # Uncomment if you want to train fresh on deployment

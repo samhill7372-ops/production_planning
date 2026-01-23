@@ -35,7 +35,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from src.data_preparation import (
     prepare_full_dataset,
     get_unique_materials_from_csv,
-    get_historical_yield_by_material
+    get_historical_yield_by_material,
+    get_available_years
 )
 from src.model_training import YieldPredictionModel, train_yield_model, OutputMaterialClassifier, train_output_classifier
 from src.prediction_utils import (
@@ -109,6 +110,8 @@ CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
 @st.cache_resource
 def load_model_artifacts():
     """Load trained model and artifacts from models/ folder."""
+    import json
+
     try:
         model_path = os.path.join(MODELS_DIR, "yield_model.joblib")
         if not os.path.exists(model_path):
@@ -119,6 +122,13 @@ def load_model_artifacts():
         feature_columns = joblib.load(os.path.join(MODELS_DIR, "feature_columns.joblib")) if os.path.exists(os.path.join(MODELS_DIR, "feature_columns.joblib")) else []
         metrics = joblib.load(os.path.join(MODELS_DIR, "metrics.joblib")) if os.path.exists(os.path.join(MODELS_DIR, "metrics.joblib")) else {}
         test_results = pd.read_csv(os.path.join(DATA_DIR, "test_results.csv")) if os.path.exists(os.path.join(DATA_DIR, "test_results.csv")) else None
+
+        # Load model metadata (includes training years)
+        model_metadata = {}
+        metadata_path = os.path.join(MODELS_DIR, "model_metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                model_metadata = json.load(f)
 
         # Load Output Material Classifier (if available)
         classifier = None
@@ -145,7 +155,8 @@ def load_model_artifacts():
             'test_results': test_results,
             'classifier': classifier,
             'classifier_features': classifier_features,
-            'classifier_metrics': classifier_metrics
+            'classifier_metrics': classifier_metrics,
+            'model_metadata': model_metadata
         }
     except Exception as e:
         st.error(f"Error loading model: {e}")
@@ -656,6 +667,153 @@ def render_layman_explanation(summary: Dict, output_results: pd.DataFrame):
         """)
 
 
+def render_prediction_explanation(output_results: pd.DataFrame, input_materials: List[Dict], model_metadata: Dict):
+    """
+    Render a detailed explanation of how predictions were calculated.
+    Shows the step-by-step process so users understand where numbers come from.
+    """
+    st.subheader("How Was This Prediction Calculated?")
+
+    # Get info about the model
+    trained_years = model_metadata.get('trained_years', [])
+    best_model = model_metadata.get('best_model', 'Unknown')
+    test_r2 = model_metadata.get('test_r2', 0)
+
+    # Step 1: Your Inputs
+    with st.expander("Step 1: Your Input Materials", expanded=True):
+        st.markdown("**What you entered:**")
+
+        for i, inp in enumerate(input_materials, 1):
+            st.markdown(f"""
+            **Input Material {i}:**
+            - Material: `{inp.get('Input_Material', 'N/A')}`
+            - Plant: `{inp.get('Input_Plant', 'N/A')}`
+            - Thickness: `{inp.get('Input_Thickness', 'N/A')}`
+            - Species: `{inp.get('Input_Specie', 'N/A')}`
+            - Grade: `{inp.get('Input_Grade', 'N/A')}`
+            - Quantity: **{inp.get('Total_Input_BF', 0):,.0f} BF**
+            """)
+
+        total_input = sum(m.get('Total_Input_BF', 0) for m in input_materials)
+        st.info(f"**Total Input:** {total_input:,.0f} Board Feet")
+
+    # Step 2: Historical Data Lookup
+    with st.expander("Step 2: Historical Data Lookup", expanded=True):
+        st.markdown(f"""
+        **What the system did:**
+
+        1. Searched the historical database (trained on **{', '.join(trained_years) if trained_years else 'available'}** data)
+        2. Found all past manufacturing orders that used similar input materials
+        3. For each past order, recorded:
+           - What output material was produced
+           - What was the yield percentage (output ÷ input)
+
+        **Example from your data:**
+        """)
+
+        # Show a sample of the historical data used
+        if len(output_results) > 0:
+            sample = output_results.head(3)
+            for _, row in sample.iterrows():
+                hist_orders = row.get('Historical_Orders', 0)
+                hist_yield = row.get('Historical_Yield_Pct', 0)
+                output_mat = row.get('Output_Material', 'N/A')
+
+                if hist_orders > 0:
+                    st.markdown(f"""
+                    - **{output_mat}**: Found **{hist_orders}** past orders with average yield of **{hist_yield:.1f}%**
+                    """)
+
+    # Step 3: ML Model Prediction
+    with st.expander("Step 3: Machine Learning Prediction", expanded=True):
+        st.markdown(f"""
+        **How the ML model works:**
+
+        1. **Model Type:** {best_model}
+        2. **Model Accuracy:** R² = {test_r2:.2%} (higher is better, 100% would be perfect)
+        3. **Training Data:** {', '.join(trained_years) if trained_years else 'Historical'} production records
+
+        **What the model considers:**
+        - Input material code (different materials have different yields)
+        - Species (e.g., WO=White Oak, SM=Soft Maple have different characteristics)
+        - Grade (1C, 2C, 3A - higher grades often have better yields)
+        - Thickness (thicker lumber may yield differently)
+        - Plant location (different equipment/processes)
+        - Input quantity (larger batches may have different efficiency)
+
+        **The model learned patterns like:**
+        > "When input is Material X with Grade 2C and Thickness 6, the yield is typically around Y%"
+        """)
+
+    # Step 4: Combining Historical + ML
+    with st.expander("Step 4: Final Prediction Calculation", expanded=True):
+        st.markdown("""
+        **How we combine the data:**
+
+        The final predicted yield is a **weighted combination** of:
+
+        1. **Historical Average** (what actually happened in the past)
+        2. **ML Model Prediction** (what the model thinks will happen)
+
+        **Formula:**
+        ```
+        Final Yield = (Weight × Historical Yield) + ((1 - Weight) × Model Yield)
+        ```
+
+        - If we have **lots of historical data** (50+ orders): Trust history more (70% historical, 30% model)
+        - If we have **little historical data** (1-10 orders): Trust model more (30% historical, 70% model)
+
+        **Then we calculate output:**
+        ```
+        Predicted Output (BF) = Input (BF) × (Predicted Yield % ÷ 100)
+        ```
+        """)
+
+        # Show actual calculation for top result
+        if len(output_results) > 0:
+            top = output_results.iloc[0]
+            pred_yield = top.get('Predicted_Yield_Pct', 0)
+            hist_yield = top.get('Historical_Yield_Pct', 0)
+            model_yield = top.get('Model_Yield_Pct', pred_yield)
+            input_bf = top.get('Input_BF', total_input)
+            output_bf = top.get('Predicted_Output_BF', 0)
+            hist_orders = top.get('Historical_Orders', 0)
+
+            st.markdown(f"""
+            ---
+            **Example Calculation (Top Result: {top.get('Output_Material', 'N/A')}):**
+
+            - Historical Yield: **{hist_yield:.1f}%** (from {hist_orders} past orders)
+            - ML Model Yield: **{model_yield:.1f}%**
+            - Combined Yield: **{pred_yield:.1f}%**
+
+            - Your Input: **{input_bf:,.0f} BF**
+            - Predicted Output: {input_bf:,.0f} × {pred_yield:.1f}% = **{output_bf:,.0f} BF**
+            """)
+
+    # Step 5: Understanding Confidence
+    with st.expander("Step 5: Why Some Predictions Are More Reliable", expanded=False):
+        st.markdown("""
+        **Confidence depends on:**
+
+        | Factor | High Confidence | Low Confidence |
+        |--------|-----------------|----------------|
+        | Historical Orders | 50+ orders | 1-5 orders |
+        | Yield Consistency | Low std deviation | High std deviation |
+        | Model R² Score | > 0.7 | < 0.5 |
+
+        **What to look for in the results table:**
+        - **Historical Orders**: More orders = more reliable prediction
+        - **Yield Std Dev**: Lower number = more consistent/predictable
+        - **Confidence Level**: HIGH/MEDIUM/LOW indicator
+
+        **Rule of thumb:**
+        - ✅ **Trust predictions** with 20+ historical orders and low std dev
+        - ⚠️ **Be cautious** with 1-5 historical orders (add safety margin)
+        - ❌ **Very uncertain** if no historical data (model-only prediction)
+        """)
+
+
 def render_analysis_chart(output_results: pd.DataFrame):
     """Render horizontal bar chart of output materials vs yield."""
     if len(output_results) == 0:
@@ -900,27 +1058,105 @@ def render_recommendation(recommendation: Dict, total_input_bf: float):
 
     # Explanation
     with st.expander("Why this recommendation?"):
+        # Calculate production loss
+        production_loss_pct = 100 - recommendation['expected_yield']
+        total_input_bf = recommendation['expected_output_bf'] / (recommendation['expected_yield'] / 100) if recommendation['expected_yield'] > 0 else 0
+        loss_bf = total_input_bf - recommendation['expected_output_bf']
+
+        # Get average yield for comparison (approximately 91-92% based on data)
+        avg_yield = 91.5  # Typical average from training data
+        avg_output = total_input_bf * (avg_yield / 100)
+
+        # Safely get yield_std and model_r2 (handle missing or non-numeric values)
+        yield_std_val = recommendation.get('yield_std', 0)
+        if not isinstance(yield_std_val, (int, float)):
+            yield_std_val = 0
+        yield_std_display = f"{yield_std_val:.1f}" if yield_std_val > 0 else "N/A"
+
+        model_r2_val = recommendation.get('model_r2', 0.3)
+        if not isinstance(model_r2_val, (int, float)):
+            model_r2_val = 0.3
+
+        # Determine impact indicators
+        yield_std_impact = '🟢 Consistent' if yield_std_val <= 10 else '🟠 Variable' if yield_std_val <= 20 else '🔴 Highly Variable'
+        model_r2_impact = '🟢 Good' if model_r2_val >= 0.5 else '🟠 Moderate' if model_r2_val >= 0.3 else '🔴 Limited'
+
         st.markdown(f"""
-        **How we calculated this:**
+        ### Step 1: What We Found in Historical Data
 
-        1. **Historical Data**: Found {recommendation['historical_orders']} past orders
-           with similar input materials producing this output.
-
-        2. **Yield Analysis**: Historical average yield combined with ML model prediction
-           gives expected yield of {recommendation['expected_yield']:.1f}%.
-
-        3. **Confidence Range**: The yield range ({recommendation['yield_range']})
-           represents a 95% confidence interval based on historical variation.
-
-        4. **Risk Assessment**: {recommendation['risk_level']} risk because:
-           - {'Sufficient' if recommendation['historical_orders'] >= 20 else 'Limited'} historical data
-           - {'Consistent' if recommendation['confidence_level'] in ['HIGH', 'MEDIUM'] else 'Variable'} yield patterns
-
-        **What this means for planning:**
-        - Plan for **{recommendation['expected_output_bf']:,.0f} BF** output (best estimate)
-        - Worst case: **{recommendation['output_range_bf'].split(' - ')[0]}**
-        - Best case: **{recommendation['output_range_bf'].split(' - ')[1]}**
+        We searched past production records and found **{recommendation['historical_orders']} order(s)**
+        where similar input materials were used to produce **{recommendation['output_material']}**.
         """)
+
+        # Warning for low historical data
+        if recommendation['historical_orders'] <= 5:
+            st.warning(f"""
+            **⚠️ Limited Data Warning**
+
+            Only **{recommendation['historical_orders']}** historical order(s) found. This means:
+            - The prediction is based on very few data points
+            - The actual yield could be significantly different
+            - Consider using the **average yield ({avg_yield:.1f}%)** as a safer estimate
+
+            **Safer Estimate:** {avg_output:,.0f} BF output (using {avg_yield:.1f}% average yield)
+            """)
+
+        st.markdown(f"""
+        ### Step 2: How Yield is Calculated
+
+        **Yield** = (Output BF ÷ Input BF) × 100
+
+        | Metric | Value |
+        |--------|-------|
+        | Your Input | {total_input_bf:,.0f} BF |
+        | Predicted Output | {recommendation['expected_output_bf']:,.0f} BF |
+        | **Predicted Yield** | **{recommendation['expected_yield']:.1f}%** |
+
+        ### Step 3: Production Loss Explained
+
+        In any production process, some material is lost due to:
+        - Sawdust and cutting waste
+        - Trimming and edge losses
+        - Defects and rejects
+        - Moisture content changes
+
+        | Loss Calculation | Value |
+        |-----------------|-------|
+        | Input Material | {total_input_bf:,.0f} BF |
+        | Expected Output | {recommendation['expected_output_bf']:,.0f} BF |
+        | **Expected Loss** | **{loss_bf:,.0f} BF ({production_loss_pct:.1f}%)** |
+
+        ### Step 4: Why This Confidence Level?
+
+        **Confidence Score: {recommendation['confidence_score']}/100** = **{recommendation['confidence_level']}**
+
+        The score is based on 3 factors:
+
+        | Factor | Your Data | Impact |
+        |--------|-----------|--------|
+        | Historical Orders | {recommendation['historical_orders']} | {'🟢 Good (20+)' if recommendation['historical_orders'] >= 20 else '🟠 Limited (5-19)' if recommendation['historical_orders'] >= 5 else '🔴 Very Limited (<5)'} |
+        | Yield Consistency | {yield_std_display}% std dev | {yield_std_impact} |
+        | Model R² | {model_r2_val:.2f} | {model_r2_impact} |
+
+        ### Step 5: Planning Recommendation
+
+        | Scenario | Output (BF) | Yield |
+        |----------|-------------|-------|
+        | **Best Estimate** | {recommendation['expected_output_bf']:,.0f} | {recommendation['expected_yield']:.1f}% |
+        | Optimistic | {recommendation['output_range_bf'].split(' - ')[1]} | {recommendation['yield_range'].split(' - ')[1]} |
+        | Conservative | {recommendation['output_range_bf'].split(' - ')[0]} | {recommendation['yield_range'].split(' - ')[0]} |
+        """)
+
+        # Additional recommendation for low confidence
+        if recommendation['confidence_level'] in ['LOW', 'VERY LOW']:
+            st.info(f"""
+            **💡 Recommendation for Low Confidence Predictions**
+
+            Since confidence is {recommendation['confidence_level']}, consider:
+            1. **Use conservative estimate**: Plan for {recommendation['output_range_bf'].split(' - ')[0]} output
+            2. **Use average yield**: {avg_yield:.1f}% → {avg_output:,.0f} BF output
+            3. **Build in buffer**: Order extra input material to account for uncertainty
+            """)
 
 
 def render_enhanced_results(output_results: pd.DataFrame):
@@ -1091,17 +1327,211 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        st.header("System Info")
+        # =====================================================================
+        # DATA UPLOAD SECTION
+        # =====================================================================
+        st.header("Data Upload")
+
+        with st.expander("Upload CSV Files", expanded=False):
+            st.markdown("""
+            Upload your SAP data files to train the model.
+
+            **Required for each year:**
+            - **261 file**: Input materials (Goods Issue)
+            - **101 file**: Output materials (Goods Receipt)
+
+            *Both files must be uploaded for a year to be available for training.*
+            """)
+
+            # Year input
+            upload_year = st.text_input(
+                "Data Year",
+                value="2025",
+                help="Year for the uploaded data (e.g., 2024, 2025)"
+            )
+
+            # File uploaders
+            file_261 = st.file_uploader(
+                "261 (Input) - Goods Issue",
+                type=['csv'],
+                key="upload_261",
+                help="Raw materials consumed from stock"
+            )
+
+            file_101 = st.file_uploader(
+                "101 (Output) - Goods Receipt",
+                type=['csv'],
+                key="upload_101",
+                help="Finished goods received into stock"
+            )
+
+            # Upload button
+            if st.button("Save Uploaded Files", type="primary", use_container_width=True):
+                if not upload_year.isdigit() or len(upload_year) != 4:
+                    st.error("Please enter a valid 4-digit year")
+                elif not file_261 and not file_101:
+                    st.error("Please upload at least one file")
+                else:
+                    import os
+                    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+                    os.makedirs(data_dir, exist_ok=True)
+
+                    saved_files = []
+
+                    if file_261:
+                        path_261 = os.path.join(data_dir, f"261_{upload_year}.csv")
+                        with open(path_261, "wb") as f:
+                            f.write(file_261.getbuffer())
+                        saved_files.append(f"261_{upload_year}.csv")
+
+                    if file_101:
+                        path_101 = os.path.join(data_dir, f"101_{upload_year}.csv")
+                        with open(path_101, "wb") as f:
+                            f.write(file_101.getbuffer())
+                        saved_files.append(f"101_{upload_year}.csv")
+
+                    st.success(f"Saved: {', '.join(saved_files)}")
+
+                    # Check if both files now exist for this year
+                    check_261 = os.path.exists(os.path.join(data_dir, f"261_{upload_year}.csv"))
+                    check_101 = os.path.exists(os.path.join(data_dir, f"101_{upload_year}.csv"))
+
+                    if check_261 and check_101:
+                        st.success(f"Year {upload_year} is now ready for training!")
+                    elif check_261:
+                        st.warning(f"Still need 101_{upload_year}.csv to train for {upload_year}")
+                    elif check_101:
+                        st.warning(f"Still need 261_{upload_year}.csv to train for {upload_year}")
+
+                    # Clear caches to detect new files
+                    load_historical_data.clear()
+                    st.rerun()
+
+            # Show current data files status
+            st.markdown("---")
+            st.markdown("**Data Files Status:**")
+
+            import os
+            data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+            # Scan for all year files
+            all_years = set()
+            files_261 = set()
+            files_101 = set()
+
+            if os.path.exists(data_dir):
+                import re
+                for f in os.listdir(data_dir):
+                    match = re.match(r'(101|261)_(\d{4})\.csv$', f, re.IGNORECASE)
+                    if match:
+                        file_type, year = match.groups()
+                        all_years.add(year)
+                        if file_type == '261':
+                            files_261.add(year)
+                        else:
+                            files_101.add(year)
+
+            if all_years:
+                for year in sorted(all_years):
+                    has_261 = year in files_261
+                    has_101 = year in files_101
+                    if has_261 and has_101:
+                        st.success(f"{year}: Ready (261 + 101)")
+                    elif has_261:
+                        st.warning(f"{year}: Missing 101 file")
+                    elif has_101:
+                        st.warning(f"{year}: Missing 261 file")
+            else:
+                st.info("No data files uploaded yet")
+
+        st.markdown("---")
+
+        # =====================================================================
+        # MODEL TRAINING SECTION
+        # =====================================================================
+        st.header("Model Training")
+
+        # Get available years from data files
+        available_years = get_available_years()
+
+        if available_years:
+            st.markdown(f"**Available years:** {', '.join(available_years)}")
+
+            # Use checkboxes for year selection (clearer than multiselect)
+            st.markdown("Select years to train:")
+            selected_years = []
+            cols = st.columns(len(available_years)) if len(available_years) <= 4 else st.columns(4)
+            for i, year in enumerate(available_years):
+                col_idx = i % len(cols)
+                with cols[col_idx]:
+                    if st.checkbox(year, value=True, key=f"year_{year}"):
+                        selected_years.append(year)
+
+            # Show selection summary
+            if selected_years:
+                st.info(f"Training on: {', '.join(selected_years)}")
+            else:
+                st.warning("Select at least one year")
+
+            # Train button
+            if st.button("Train Model", type="primary", use_container_width=True, disabled=len(selected_years) == 0):
+                with st.spinner(f"Training model on {', '.join(selected_years)} data..."):
+                    try:
+                        # Prepare data for selected years
+                        df, encoders = prepare_full_dataset(years=selected_years)
+
+                        # Train model with year metadata
+                        model = train_yield_model(df, encoders, years=selected_years)
+
+                        st.success(f"Model trained successfully on {', '.join(selected_years)} data!")
+
+                        # Clear cache to reload new model
+                        load_model_artifacts.clear()
+                        load_historical_data.clear()
+
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Training failed: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+        else:
+            st.warning("No data files found. Upload 261 and 101 CSV files above.")
+
+        st.markdown("---")
+
+        # =====================================================================
+        # CURRENT MODEL INFO SECTION
+        # =====================================================================
+        st.header("Current Model")
 
         if artifacts:
-            st.success("Yield Model Loaded")
+            st.success("Model Loaded")
+
+            # Show training years from metadata
+            model_metadata = artifacts.get('model_metadata', {})
+            trained_years = model_metadata.get('trained_years', [])
+            if trained_years:
+                st.info(f"Trained on: {', '.join(trained_years)}")
+
+            # Show trained timestamp
+            trained_at = model_metadata.get('trained_at', '')
+            if trained_at:
+                # Format the timestamp nicely
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(trained_at)
+                    st.caption(f"Trained: {dt.strftime('%Y-%m-%d %H:%M')}")
+                except:
+                    pass
+
+            # Show model metrics
             if artifacts['metrics']:
                 best_r2 = max(
                     m.get('test_r2', m.get('R2', 0))
                     for m in artifacts['metrics'].values()
                     if isinstance(m, dict)
                 )
-                st.info(f"Yield Model R²: {best_r2:.4f}")
+                st.metric("Model R² Score", f"{best_r2:.4f}")
 
             # Show classifier info if available
             if artifacts.get('classifier') is not None:
@@ -1113,20 +1543,12 @@ def main():
                         for m in classifier_metrics.values()
                         if isinstance(m, dict)
                     )
-                    st.info(f"Classifier Accuracy: {best_acc:.2%}")
+                    st.metric("Classifier Accuracy", f"{best_acc:.2%}")
             else:
                 st.warning("Output Classifier not trained")
         else:
-            st.warning("Model not trained")
-            if st.button("Train Model"):
-                with st.spinner("Training model... This may take a few minutes."):
-                    try:
-                        df, encoders = prepare_full_dataset()
-                        model = train_yield_model(df, encoders)
-                        st.success("Model trained successfully!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Training failed: {e}")
+            st.warning("No model trained yet")
+            st.caption("Select years above and click 'Train Model' to get started")
 
         st.markdown("---")
         st.markdown("""
@@ -1242,6 +1664,7 @@ def main():
                     st.session_state.predicted_outputs = predicted_outputs
                     st.session_state.recommendation = recommendation
                     st.session_state.total_input_bf = total_input_bf
+                    st.session_state.input_materials_used = input_materials  # Store for explanation
                     st.session_state.prediction_run = True
 
                 except Exception as e:
@@ -1252,7 +1675,7 @@ def main():
     # Display Results
     if st.session_state.get('prediction_run'):
         st.markdown("---")
-        st.header("3. Prediction Results")
+        st.header("2. Prediction Results")
 
         output_results = st.session_state.get('output_results', pd.DataFrame())
         summary = st.session_state.get('prediction_summary', {})
@@ -1280,8 +1703,9 @@ def main():
         st.subheader("All Output Options & Analysis")
 
         # Tabs for detailed views - use enhanced results
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "Enhanced Results",
+            "How It Was Calculated",
             "Analysis Chart",
             "Basic Results",
             "Model Performance",
@@ -1292,15 +1716,21 @@ def main():
             render_enhanced_results(output_results)
 
         with tab2:
-            render_analysis_chart(output_results)
+            # Get model metadata and input materials for explanation
+            model_metadata = artifacts.get('model_metadata', {})
+            input_materials_used = st.session_state.get('input_materials_used', [])
+            render_prediction_explanation(output_results, input_materials_used, model_metadata)
 
         with tab3:
-            render_detailed_results(output_results)
+            render_analysis_chart(output_results)
 
         with tab4:
-            render_model_performance(metrics)
+            render_detailed_results(output_results)
 
         with tab5:
+            render_model_performance(metrics)
+
+        with tab6:
             render_test_results(test_results)
 
 
