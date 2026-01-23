@@ -1,0 +1,21 @@
+{
+  "trained_years": [
+    "2024"
+  ],
+  "trained_at": "2026-01-22T19:57:39.961219",
+  "best_model": "RandomForest",
+  "test_r2": 0.28855355914558556,
+  "test_rmse": 4.263310562112406,
+  "test_mae": 2.6114477375934566,
+  "num_features": 8,
+  "feature_columns": [
+    "Input_Material_Encoded",
+    "Input_Specie_Encoded",
+    "Input_Grade_Encoded",
+    "Input_Plant_Encoded",
+    "Input_Thickness",
+    "Input_Length",
+    "Input_Width",
+    "Total_Input_BF"
+  ]
+}

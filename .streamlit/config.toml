@@ -7,8 +7,9 @@ enableXsrfProtection = true
 # Port will be set by $PORT environment variable in BTP
 # port = 8080
 
-# Allow large file uploads (in MB) - set to 2GB for large CSV files
-maxUploadSize = 2000
+# Allow large file uploads (in MB) - set to 5GB for large CSV files
+maxUploadSize = 5000
+maxMessageSize = 5000
 
 [browser]
 # Disable usage statistics in production

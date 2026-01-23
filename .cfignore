@@ -73,17 +73,13 @@ docs/
 *.tmp
 *.bak
 
-# Large data files (excluded to save memory - model is already trained)
-# Keep only small reference files in config/
-data/101.csv
-data/261.csv
+# Large data files - EXCLUDED (too large for BTP staging)
 data/101_2024.csv
 data/261_2024.csv
 data/101_2025.csv
 data/261_2025.csv
-data/*_2024.csv
-data/*_2025.csv
+data/101.csv
+data/261.csv
 
-# Model files that will be regenerated
-# Uncomment if you want to train fresh on deployment
-# *.joblib
+# Keep model files (pre-trained) - DO NOT exclude
+# Models will be deployed so app works without training

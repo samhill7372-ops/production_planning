@@ -107,25 +107,49 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
 
 
+def get_available_model_years():
+    """Get list of years with trained models."""
+    years = []
+    if os.path.exists(MODELS_DIR):
+        for item in os.listdir(MODELS_DIR):
+            item_path = os.path.join(MODELS_DIR, item)
+            if os.path.isdir(item_path) and item.isdigit():
+                # Check if model exists in this folder
+                if os.path.exists(os.path.join(item_path, "yield_model.joblib")):
+                    years.append(item)
+    return sorted(years)
+
+
 @st.cache_resource
-def load_model_artifacts():
-    """Load trained model and artifacts from models/ folder."""
+def load_model_artifacts(model_year: str = None):
+    """Load trained model and artifacts from models/ folder.
+
+    Args:
+        model_year: Specific year to load (e.g., '2024', '2025').
+                    If None, loads from root models/ folder.
+    """
     import json
 
+    # Determine model path
+    if model_year:
+        base_path = os.path.join(MODELS_DIR, model_year)
+    else:
+        base_path = MODELS_DIR
+
     try:
-        model_path = os.path.join(MODELS_DIR, "yield_model.joblib")
+        model_path = os.path.join(base_path, "yield_model.joblib")
         if not os.path.exists(model_path):
             return None
 
         model = joblib.load(model_path)
-        encoders = joblib.load(os.path.join(MODELS_DIR, "encoders.joblib")) if os.path.exists(os.path.join(MODELS_DIR, "encoders.joblib")) else {}
-        feature_columns = joblib.load(os.path.join(MODELS_DIR, "feature_columns.joblib")) if os.path.exists(os.path.join(MODELS_DIR, "feature_columns.joblib")) else []
-        metrics = joblib.load(os.path.join(MODELS_DIR, "metrics.joblib")) if os.path.exists(os.path.join(MODELS_DIR, "metrics.joblib")) else {}
-        test_results = pd.read_csv(os.path.join(DATA_DIR, "test_results.csv")) if os.path.exists(os.path.join(DATA_DIR, "test_results.csv")) else None
+        encoders = joblib.load(os.path.join(base_path, "encoders.joblib")) if os.path.exists(os.path.join(base_path, "encoders.joblib")) else {}
+        feature_columns = joblib.load(os.path.join(base_path, "feature_columns.joblib")) if os.path.exists(os.path.join(base_path, "feature_columns.joblib")) else []
+        metrics = joblib.load(os.path.join(base_path, "metrics.joblib")) if os.path.exists(os.path.join(base_path, "metrics.joblib")) else {}
+        test_results = pd.read_csv(os.path.join(base_path, "test_results.csv")) if os.path.exists(os.path.join(base_path, "test_results.csv")) else None
 
         # Load model metadata (includes training years)
         model_metadata = {}
-        metadata_path = os.path.join(MODELS_DIR, "model_metadata.json")
+        metadata_path = os.path.join(base_path, "model_metadata.json")
         if os.path.exists(metadata_path):
             with open(metadata_path, 'r') as f:
                 model_metadata = json.load(f)
@@ -135,15 +159,15 @@ def load_model_artifacts():
         classifier_features = []
         classifier_metrics = {}
 
-        classifier_path = os.path.join(MODELS_DIR, "output_classifier.joblib")
+        classifier_path = os.path.join(base_path, "output_classifier.joblib")
         if os.path.exists(classifier_path):
             classifier = joblib.load(classifier_path)
 
-        clf_features_path = os.path.join(MODELS_DIR, "classifier_features.joblib")
+        clf_features_path = os.path.join(base_path, "classifier_features.joblib")
         if os.path.exists(clf_features_path):
             classifier_features = joblib.load(clf_features_path)
 
-        clf_metrics_path = os.path.join(MODELS_DIR, "classifier_metrics.joblib")
+        clf_metrics_path = os.path.join(base_path, "classifier_metrics.joblib")
         if os.path.exists(clf_metrics_path):
             classifier_metrics = joblib.load(clf_metrics_path)
 
@@ -1320,132 +1344,33 @@ def main():
     st.markdown('<h1 class="main-header">Production Planning - Material Yield Prediction</h1>',
                 unsafe_allow_html=True)
 
-    # Load artifacts
-    artifacts = load_model_artifacts()
-    # Load historical data (uses caching, will work locally with CSVs)
-    historical_data = load_historical_data()
+    # Get available pre-trained model years
+    available_model_years = get_available_model_years()
 
     # Sidebar
     with st.sidebar:
         # =====================================================================
-        # DATA UPLOAD SECTION
+        # MODEL SELECTION SECTION
         # =====================================================================
-        st.header("Data Upload")
-
-        with st.expander("Upload CSV Files", expanded=False):
-            st.markdown("""
-            Upload your SAP data files to train the model.
-
-            **Required for each year:**
-            - **261 file**: Input materials (Goods Issue)
-            - **101 file**: Output materials (Goods Receipt)
-
-            *Both files must be uploaded for a year to be available for training.*
-            """)
-
-            # Year input
-            upload_year = st.text_input(
-                "Data Year",
-                value="2025",
-                help="Year for the uploaded data (e.g., 2024, 2025)"
+        if available_model_years:
+            st.header("Model Selection")
+            selected_model_year = st.selectbox(
+                "Select prediction model:",
+                options=available_model_years,
+                index=len(available_model_years) - 1,  # Default to latest year
+                help="Choose which year's trained model to use for predictions"
             )
-
-            # File uploaders
-            file_261 = st.file_uploader(
-                "261 (Input) - Goods Issue",
-                type=['csv'],
-                key="upload_261",
-                help="Raw materials consumed from stock"
-            )
-
-            file_101 = st.file_uploader(
-                "101 (Output) - Goods Receipt",
-                type=['csv'],
-                key="upload_101",
-                help="Finished goods received into stock"
-            )
-
-            # Upload button
-            if st.button("Save Uploaded Files", type="primary", use_container_width=True):
-                if not upload_year.isdigit() or len(upload_year) != 4:
-                    st.error("Please enter a valid 4-digit year")
-                elif not file_261 and not file_101:
-                    st.error("Please upload at least one file")
-                else:
-                    import os
-                    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-                    os.makedirs(data_dir, exist_ok=True)
-
-                    saved_files = []
-
-                    if file_261:
-                        path_261 = os.path.join(data_dir, f"261_{upload_year}.csv")
-                        with open(path_261, "wb") as f:
-                            f.write(file_261.getbuffer())
-                        saved_files.append(f"261_{upload_year}.csv")
-
-                    if file_101:
-                        path_101 = os.path.join(data_dir, f"101_{upload_year}.csv")
-                        with open(path_101, "wb") as f:
-                            f.write(file_101.getbuffer())
-                        saved_files.append(f"101_{upload_year}.csv")
-
-                    st.success(f"Saved: {', '.join(saved_files)}")
-
-                    # Check if both files now exist for this year
-                    check_261 = os.path.exists(os.path.join(data_dir, f"261_{upload_year}.csv"))
-                    check_101 = os.path.exists(os.path.join(data_dir, f"101_{upload_year}.csv"))
-
-                    if check_261 and check_101:
-                        st.success(f"Year {upload_year} is now ready for training!")
-                    elif check_261:
-                        st.warning(f"Still need 101_{upload_year}.csv to train for {upload_year}")
-                    elif check_101:
-                        st.warning(f"Still need 261_{upload_year}.csv to train for {upload_year}")
-
-                    # Clear caches to detect new files
-                    load_historical_data.clear()
-                    st.rerun()
-
-            # Show current data files status
             st.markdown("---")
-            st.markdown("**Data Files Status:**")
+        else:
+            selected_model_year = None
 
-            import os
-            data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    # Load artifacts for selected model year
+    artifacts = load_model_artifacts(selected_model_year)
+    # Load historical data (uses caching, will work locally with CSVs)
+    historical_data = load_historical_data()
 
-            # Scan for all year files
-            all_years = set()
-            files_261 = set()
-            files_101 = set()
-
-            if os.path.exists(data_dir):
-                import re
-                for f in os.listdir(data_dir):
-                    match = re.match(r'(101|261)_(\d{4})\.csv$', f, re.IGNORECASE)
-                    if match:
-                        file_type, year = match.groups()
-                        all_years.add(year)
-                        if file_type == '261':
-                            files_261.add(year)
-                        else:
-                            files_101.add(year)
-
-            if all_years:
-                for year in sorted(all_years):
-                    has_261 = year in files_261
-                    has_101 = year in files_101
-                    if has_261 and has_101:
-                        st.success(f"{year}: Ready (261 + 101)")
-                    elif has_261:
-                        st.warning(f"{year}: Missing 101 file")
-                    elif has_101:
-                        st.warning(f"{year}: Missing 261 file")
-            else:
-                st.info("No data files uploaded yet")
-
-        st.markdown("---")
-
+    # Continue sidebar content
+    with st.sidebar:
         # =====================================================================
         # MODEL TRAINING SECTION
         # =====================================================================
@@ -1455,47 +1380,41 @@ def main():
         available_years = get_available_years()
 
         if available_years:
-            st.markdown(f"**Available years:** {', '.join(available_years)}")
-
-            # Use checkboxes for year selection (clearer than multiselect)
-            st.markdown("Select years to train:")
-            selected_years = []
-            cols = st.columns(len(available_years)) if len(available_years) <= 4 else st.columns(4)
-            for i, year in enumerate(available_years):
-                col_idx = i % len(cols)
-                with cols[col_idx]:
-                    if st.checkbox(year, value=True, key=f"year_{year}"):
-                        selected_years.append(year)
-
-            # Show selection summary
-            if selected_years:
-                st.info(f"Training on: {', '.join(selected_years)}")
-            else:
-                st.warning("Select at least one year")
+            # Year selection
+            selected_years = st.multiselect(
+                "Select years to train:",
+                options=available_years,
+                default=available_years,
+                help="Choose which year(s) of data to use for training"
+            )
 
             # Train button
             if st.button("Train Model", type="primary", use_container_width=True, disabled=len(selected_years) == 0):
-                with st.spinner(f"Training model on {', '.join(selected_years)} data..."):
+                with st.spinner(f"Training on {', '.join(selected_years)} data..."):
                     try:
-                        # Prepare data for selected years
                         df, encoders = prepare_full_dataset(years=selected_years)
 
-                        # Train model with year metadata
-                        model = train_yield_model(df, encoders, years=selected_years)
+                        # Determine save path based on selected years
+                        # Single year: save to models/{year}/
+                        # Multiple years: save to root models/
+                        if len(selected_years) == 1:
+                            save_path = os.path.join(MODELS_DIR, selected_years[0])
+                        else:
+                            save_path = MODELS_DIR
 
-                        st.success(f"Model trained successfully on {', '.join(selected_years)} data!")
+                        model = train_yield_model(df, encoders, save_path=save_path, years=selected_years)
 
-                        # Clear cache to reload new model
+                        st.success(f"Trained on {', '.join(selected_years)}!")
+
                         load_model_artifacts.clear()
                         load_historical_data.clear()
-
                         st.rerun()
                     except Exception as e:
                         st.error(f"Training failed: {e}")
                         import traceback
                         st.code(traceback.format_exc())
         else:
-            st.warning("No data files found. Upload 261 and 101 CSV files above.")
+            st.warning("No data files found.")
 
         st.markdown("---")
 
@@ -1505,7 +1424,11 @@ def main():
         st.header("Current Model")
 
         if artifacts:
-            st.success("Model Loaded")
+            # Show which model year is selected
+            if selected_model_year:
+                st.success(f"Using {selected_model_year} Model")
+            else:
+                st.success("Model Loaded")
 
             # Show training years from metadata
             model_metadata = artifacts.get('model_metadata', {})

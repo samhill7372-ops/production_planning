@@ -1,0 +1,9 @@
+Feature,Importance
+Total_Input_BF,0.22836180016223961
+Input_Width,0.16808480967504347
+Input_Length,0.1517657927219424
+Input_Plant_Encoded,0.1385941040934882
+Input_Material_Encoded,0.10801356652690956
+Input_Specie_Encoded,0.09687814538838725
+Input_Grade_Encoded,0.06815618063252037
+Input_Thickness,0.040145600799469126

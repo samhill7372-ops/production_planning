@@ -2,11 +2,11 @@
   "trained_years": [
     "2025"
   ],
-  "trained_at": "2026-01-22T19:17:49.859801",
-  "best_model": "Ridge",
-  "test_r2": 0.3190366444566125,
-  "test_rmse": 83.7766220881987,
-  "test_mae": 69.14658640001818,
+  "trained_at": "2026-01-22T19:57:56.106656",
+  "best_model": "GradientBoosting",
+  "test_r2": 0.38243322793978485,
+  "test_rmse": 3.8167894444819335,
+  "test_mae": 2.4122595684831545,
   "num_features": 8,
   "feature_columns": [
     "Input_Material_Encoded",
