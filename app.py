@@ -50,7 +50,9 @@ from src.prediction_utils import (
     estimate_material_waste,
     predict_output_material,
     get_top_recommendation,
-    calculate_confidence_level
+    calculate_confidence_level,
+    get_historical_kd_distribution,
+    calculate_kd_output_with_wastage
 )
 
 # Page configuration
@@ -611,6 +613,285 @@ def render_reverse_prediction_section(model, encoders, feature_columns, options)
                     ]
                 }
                 st.table(pd.DataFrame(breakdown_data))
+
+
+def render_kd_material_lookup_section(options, historical_data):
+    """Render the KD Material Lookup section - find historical KD outputs for a KS input."""
+    st.subheader("KD Material Lookup: Find Output Materials")
+    st.caption("Enter a KS (input) material to see which KD (output) materials it has historically produced")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**Input Material (KS)**")
+
+        # Plant selection
+        plant_options = options.get('Input_Plant', ['1M02', '1Y01'])
+        kd_plant = st.selectbox(
+            "Plant",
+            options=plant_options if plant_options else ['1M02'],
+            key="kd_plant"
+        )
+
+        # Material selection with search
+        material_options = options.get('Input_Material', [])
+        kd_mat_search = st.text_input(
+            "Search Material",
+            key="kd_mat_search",
+            placeholder="Type to filter (e.g., 4PO3BKS)..."
+        )
+
+        if kd_mat_search:
+            filtered = [m for m in material_options if kd_mat_search.upper() in str(m).upper()]
+        else:
+            filtered = material_options
+
+        kd_material = st.selectbox(
+            f"Input Material ({len(filtered)} available)",
+            options=filtered if filtered else ['No materials found'],
+            key="kd_material"
+        )
+
+    with col2:
+        st.markdown("**Material Properties (Optional Filters)**")
+
+        # Thickness
+        thickness_options = options.get('Input_Thickness', [4, 6, 8])
+        kd_thickness = st.selectbox(
+            "Thickness",
+            options=[None] + list(thickness_options) if thickness_options else [None, 4, 6, 8],
+            format_func=lambda x: "Any" if x is None else str(x),
+            key="kd_thickness"
+        )
+
+        # Species
+        specie_options = options.get('Input_Specie', ['SM', 'AS', 'WO'])
+        kd_specie = st.selectbox(
+            "Species",
+            options=[None] + list(specie_options) if specie_options else [None],
+            format_func=lambda x: "Any" if x is None else str(x),
+            key="kd_specie"
+        )
+
+        # Grade
+        grade_options = options.get('Input_Grade', ['2C', '1C', '3A'])
+        kd_grade = st.selectbox(
+            "Grade",
+            options=[None] + list(grade_options) if grade_options else [None],
+            format_func=lambda x: "Any" if x is None else str(x),
+            key="kd_grade"
+        )
+
+    st.markdown("---")
+
+    # Quantity and Wastage inputs
+    col3, col4 = st.columns(2)
+
+    with col3:
+        kd_input_bf = st.number_input(
+            "Input Quantity (BF)",
+            min_value=0.0,
+            max_value=10000000.0,
+            value=10000.0,
+            step=1000.0,
+            key="kd_input_bf",
+            help="Total board feet of input material"
+        )
+
+    with col4:
+        kd_wastage = st.number_input(
+            "Wastage %",
+            min_value=0.0,
+            max_value=50.0,
+            value=9.0,
+            step=0.5,
+            key="kd_wastage",
+            help="Percentage of material lost during production (default 9%)"
+        )
+
+    # Find KD Materials button
+    if st.button("Find KD Materials", type="primary", key="kd_lookup_btn", use_container_width=True):
+        if historical_data is None or len(historical_data) == 0:
+            st.error("No historical data available. Please ensure data files are loaded.")
+            return
+
+        if kd_material == 'No materials found':
+            st.error("Please select a valid input material.")
+            return
+
+        with st.spinner("Looking up historical KD outputs..."):
+            # Get historical distribution
+            kd_distribution = get_historical_kd_distribution(
+                input_material=kd_material,
+                historical_data=historical_data,
+                input_thickness=kd_thickness,
+                input_grade=kd_grade,
+                input_species=kd_specie
+            )
+
+            if not kd_distribution:
+                st.warning(f"No historical data found for material: **{kd_material}**")
+                st.info("Try removing the optional filters (Thickness, Species, Grade) or selecting a different material.")
+                return
+
+            # Calculate output with wastage
+            result = calculate_kd_output_with_wastage(
+                input_bf=kd_input_bf,
+                kd_distribution=kd_distribution,
+                wastage_pct=kd_wastage
+            )
+
+            # Store in session state
+            st.session_state.kd_lookup_result = result
+            st.session_state.kd_lookup_material = kd_material
+            st.session_state.kd_lookup_run = True
+
+    # Display Results
+    if st.session_state.get('kd_lookup_run'):
+        result = st.session_state.get('kd_lookup_result', {})
+        input_material = st.session_state.get('kd_lookup_material', '')
+
+        st.markdown("---")
+        st.header("KD Output Materials")
+
+        # Summary metrics
+        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+
+        with col_s1:
+            st.metric("Input Material", input_material)
+
+        with col_s2:
+            st.metric("Input Quantity", f"{result['input_bf']:,.0f} BF")
+
+        with col_s3:
+            st.metric("Wastage", f"{result['wastage_bf']:,.0f} BF ({result['wastage_pct']}%)")
+
+        with col_s4:
+            st.metric("Available for Output", f"{result['available_bf']:,.0f} BF")
+
+        st.markdown("---")
+
+        # KD Materials Table
+        st.subheader(f"Historical KD Outputs for {input_material}")
+
+        kd_outputs = result.get('kd_outputs', [])
+
+        if kd_outputs:
+            # Create DataFrame for display
+            df_display = pd.DataFrame(kd_outputs)
+
+            # Add selection checkboxes via session state
+            if 'selected_kds' not in st.session_state:
+                st.session_state.selected_kds = []
+
+            # Display as interactive table
+            st.markdown("**Select KD material(s) to create production order:**")
+
+            # Create selection UI
+            selected_kds = []
+            for i, kd in enumerate(kd_outputs):
+                col_check, col_mat, col_count, col_pct, col_bf = st.columns([0.5, 2, 1, 1, 1.5])
+
+                with col_check:
+                    is_selected = st.checkbox("", key=f"kd_select_{i}", label_visibility="collapsed")
+                    if is_selected:
+                        selected_kds.append(kd)
+
+                with col_mat:
+                    st.write(f"**{kd['Output_Material']}**")
+
+                with col_count:
+                    st.write(f"{kd['Order_Count']} orders")
+
+                with col_pct:
+                    st.write(f"{kd['Percentage']:.1f}%")
+
+                with col_bf:
+                    st.write(f"**{kd['Expected_Output_BF']:,.0f} BF**")
+
+            # Total row
+            st.markdown("---")
+            col_t1, col_t2, col_t3, col_t4, col_t5 = st.columns([0.5, 2, 1, 1, 1.5])
+            with col_t2:
+                st.write("**TOTAL**")
+            with col_t3:
+                total_orders = sum(kd['Order_Count'] for kd in kd_outputs)
+                st.write(f"**{total_orders}**")
+            with col_t4:
+                st.write("**100%**")
+            with col_t5:
+                st.write(f"**{result['available_bf']:,.0f} BF**")
+
+            # Store selected KDs
+            st.session_state.selected_kds = selected_kds
+
+            # Production Order Section
+            if selected_kds:
+                st.markdown("---")
+                st.subheader("Production Order Summary")
+
+                # Calculate selected totals
+                selected_bf = sum(kd['Expected_Output_BF'] for kd in selected_kds)
+                selected_pct = sum(kd['Percentage'] for kd in selected_kds)
+
+                # Display production order summary
+                st.success(f"""
+                **Production Order for {input_material}**
+
+                - **Input Quantity:** {result['input_bf']:,.0f} BF
+                - **Wastage ({result['wastage_pct']}%):** {result['wastage_bf']:,.0f} BF
+                - **Available Output:** {result['available_bf']:,.0f} BF
+                """)
+
+                st.markdown("**Selected Outputs:**")
+
+                order_data = []
+                for kd in selected_kds:
+                    order_data.append({
+                        'KD Material': kd['Output_Material'],
+                        'Historical %': f"{kd['Percentage']:.1f}%",
+                        'Planned Output (BF)': f"{kd['Expected_Output_BF']:,.0f}"
+                    })
+
+                order_df = pd.DataFrame(order_data)
+                st.table(order_df)
+
+                st.info(f"**Total Selected Output:** {selected_bf:,.0f} BF ({selected_pct:.1f}% of available)")
+
+                # Export button
+                export_data = {
+                    'Input_Material': input_material,
+                    'Input_Quantity_BF': result['input_bf'],
+                    'Wastage_Pct': result['wastage_pct'],
+                    'Wastage_BF': result['wastage_bf'],
+                    'Available_Output_BF': result['available_bf'],
+                    'Selected_Outputs': selected_kds
+                }
+
+                # Create CSV for download
+                export_rows = []
+                for kd in selected_kds:
+                    export_rows.append({
+                        'Input_Material': input_material,
+                        'Input_Quantity_BF': result['input_bf'],
+                        'Wastage_Pct': result['wastage_pct'],
+                        'Available_Output_BF': result['available_bf'],
+                        'Output_Material': kd['Output_Material'],
+                        'Historical_Order_Count': kd['Order_Count'],
+                        'Historical_Percentage': kd['Percentage'],
+                        'Planned_Output_BF': kd['Expected_Output_BF']
+                    })
+
+                export_df = pd.DataFrame(export_rows)
+                csv = export_df.to_csv(index=False)
+
+                st.download_button(
+                    label="Download Production Order (CSV)",
+                    data=csv,
+                    file_name=f"production_order_{input_material}.csv",
+                    mime="text/csv",
+                    type="primary"
+                )
 
 
 def render_layman_explanation(summary: Dict, output_results: pd.DataFrame):
@@ -1504,12 +1785,21 @@ def main():
     st.header("1. Select Prediction Mode")
     prediction_mode = st.radio(
         "Choose prediction type:",
-        ["Forward Prediction (Input -> Output)", "Reverse Prediction (Output -> Input)"],
+        [
+            "KD Material Lookup (Find KD Outputs)",
+            "Forward Prediction (Input -> Output)",
+            "Reverse Prediction (Output -> Input)"
+        ],
         horizontal=True,
-        help="Forward: Calculate expected output from input materials. Reverse: Calculate required input for desired output."
+        help="KD Lookup: Find which KD materials a KS input has historically produced. Forward: Calculate expected output from input materials. Reverse: Calculate required input for desired output."
     )
 
     st.markdown("---")
+
+    if prediction_mode == "KD Material Lookup (Find KD Outputs)":
+        # KD Material Lookup Section
+        render_kd_material_lookup_section(options, historical_data)
+        return  # Exit early for KD lookup mode
 
     if prediction_mode == "Reverse Prediction (Output -> Input)":
         # Reverse Prediction Section

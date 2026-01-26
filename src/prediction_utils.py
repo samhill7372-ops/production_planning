@@ -913,3 +913,140 @@ def get_top_recommendation(
                    f"producing {top['Output_Material']} has a {top['Confidence_Level']} confidence level "
                    f"with expected yield of {top['Predicted_Yield_Pct']:.1f}%."
     }
+
+
+# =============================================================================
+# KD MATERIAL LOOKUP - HISTORICAL DISTRIBUTION WITH WASTAGE
+# =============================================================================
+
+def get_historical_kd_distribution(
+    input_material: str,
+    historical_data: pd.DataFrame,
+    input_thickness: float = None,
+    input_grade: str = None,
+    input_species: str = None
+) -> List[Dict[str, Any]]:
+    """
+    Get historical distribution of KD (output) materials for a given KS (input) material.
+
+    This is a simple historical lookup - no ML prediction involved.
+    Shows which output materials have historically been produced from this input.
+
+    Args:
+        input_material: Input material code (e.g., "4PO3BKS")
+        historical_data: DataFrame with joined 261+101 data (must have Input_Material, Output_Material columns)
+        input_thickness: Optional filter by thickness
+        input_grade: Optional filter by grade
+        input_species: Optional filter by species
+
+    Returns:
+        List of dicts sorted by count descending:
+        [
+            {'Output_Material': '4PO3BKD', 'Order_Count': 145, 'Percentage': 58.0},
+            {'Output_Material': '4PO2BKD', 'Order_Count': 62, 'Percentage': 25.0},
+            ...
+        ]
+        Returns empty list if no historical data found.
+    """
+    if historical_data is None or len(historical_data) == 0:
+        return []
+
+    # Check required columns
+    if 'Input_Material' not in historical_data.columns or 'Output_Material' not in historical_data.columns:
+        return []
+
+    # Filter by input material (exact match)
+    filtered = historical_data[historical_data['Input_Material'] == input_material].copy()
+
+    # Apply optional filters
+    if input_thickness is not None and 'Input_Thickness' in filtered.columns:
+        filtered = filtered[filtered['Input_Thickness'] == input_thickness]
+
+    if input_grade is not None and 'Input_Grade' in filtered.columns:
+        filtered = filtered[filtered['Input_Grade'] == input_grade]
+
+    if input_species is not None and 'Input_Specie' in filtered.columns:
+        filtered = filtered[filtered['Input_Specie'] == input_species]
+
+    if len(filtered) == 0:
+        return []
+
+    # Group by Output_Material and count orders
+    output_counts = filtered.groupby('Output_Material').size().reset_index(name='Order_Count')
+
+    # Calculate percentages
+    total_orders = output_counts['Order_Count'].sum()
+    output_counts['Percentage'] = (output_counts['Order_Count'] / total_orders * 100).round(2)
+
+    # Sort by count descending
+    output_counts = output_counts.sort_values('Order_Count', ascending=False).reset_index(drop=True)
+
+    # Convert to list of dicts
+    results = output_counts.to_dict('records')
+
+    return results
+
+
+def calculate_kd_output_with_wastage(
+    input_bf: float,
+    kd_distribution: List[Dict[str, Any]],
+    wastage_pct: float = 9.0
+) -> Dict[str, Any]:
+    """
+    Apply wastage and distribute expected output BF across KD materials.
+
+    Args:
+        input_bf: Input board feet (e.g., 10000)
+        kd_distribution: List from get_historical_kd_distribution()
+        wastage_pct: Wastage percentage (default 9.0)
+
+    Returns:
+        Dict with:
+        - 'input_bf': Original input BF
+        - 'wastage_pct': Wastage percentage applied
+        - 'wastage_bf': BF lost to wastage
+        - 'available_bf': BF available after wastage
+        - 'kd_outputs': List of dicts with Expected_Output_BF added to each KD material
+        - 'total_expected_bf': Sum of all expected outputs (should equal available_bf)
+
+    Example:
+        Input: 10,000 BF, 9% wastage, distribution = [{'Output_Material': '4PO3BKD', 'Percentage': 58.0}, ...]
+        Output: available_bf = 9,100, 4PO3BKD gets 5,278 BF (58% of 9,100)
+    """
+    if not kd_distribution:
+        return {
+            'input_bf': input_bf,
+            'wastage_pct': wastage_pct,
+            'wastage_bf': 0,
+            'available_bf': 0,
+            'kd_outputs': [],
+            'total_expected_bf': 0
+        }
+
+    # Calculate available BF after wastage
+    wastage_bf = input_bf * (wastage_pct / 100)
+    available_bf = input_bf - wastage_bf
+
+    # Distribute available BF across KD materials by percentage
+    kd_outputs = []
+    total_expected = 0
+
+    for kd in kd_distribution:
+        expected_bf = available_bf * (kd['Percentage'] / 100)
+        kd_output = {
+            'Output_Material': kd['Output_Material'],
+            'Order_Count': kd['Order_Count'],
+            'Percentage': kd['Percentage'],
+            'Expected_Output_BF': round(expected_bf, 2)
+        }
+        kd_outputs.append(kd_output)
+        total_expected += expected_bf
+
+    return {
+        'input_bf': input_bf,
+        'wastage_pct': wastage_pct,
+        'wastage_bf': round(wastage_bf, 2),
+        'available_bf': round(available_bf, 2),
+        'kd_outputs': kd_outputs,
+        'total_expected_bf': round(total_expected, 2)
+    }
