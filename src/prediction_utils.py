@@ -927,23 +927,23 @@ def get_historical_kd_distribution(
     input_species: str = None
 ) -> List[Dict[str, Any]]:
     """
-    Get historical distribution of KD (output) materials for a given KS (input) material.
+    Get historical distribution of KD (output) materials WITH GRADE breakdown and YIELD statistics.
 
-    This is a simple historical lookup - no ML prediction involved.
-    Shows which output materials have historically been produced from this input.
+    This is a historical lookup showing which output materials and grades have historically
+    been produced from this input, along with their average yield percentages.
 
     Args:
         input_material: Input material code (e.g., "4PO3BKS")
-        historical_data: DataFrame with joined 261+101 data (must have Input_Material, Output_Material columns)
+        historical_data: DataFrame with joined 261+101 data (must have Input_Material, Output_Material, Output_Grade, Yield_Percentage columns)
         input_thickness: Optional filter by thickness
         input_grade: Optional filter by grade
         input_species: Optional filter by species
 
     Returns:
-        List of dicts sorted by count descending:
+        List of dicts sorted by Output_Material then count descending:
         [
-            {'Output_Material': '4PO3BKD', 'Order_Count': 145, 'Percentage': 58.0},
-            {'Output_Material': '4PO2BKD', 'Order_Count': 62, 'Percentage': 25.0},
+            {'Output_Material': '4PO3BKD', 'Output_Grade': '3B', 'Order_Count': 39, 'Percentage': 34.0, 'Avg_Yield': 92.5, 'Yield_Std': 2.3},
+            {'Output_Material': '4PO3BKD', 'Output_Grade': 'PR', 'Order_Count': 1, 'Percentage': 0.9, 'Avg_Yield': 88.1, 'Yield_Std': 0.0},
             ...
         ]
         Returns empty list if no historical data found.
@@ -971,15 +971,58 @@ def get_historical_kd_distribution(
     if len(filtered) == 0:
         return []
 
-    # Group by Output_Material and count orders
-    output_counts = filtered.groupby('Output_Material').size().reset_index(name='Order_Count')
+    # Check if Output_Grade and Yield_Percentage columns exist
+    has_output_grade = 'Output_Grade' in filtered.columns
+    has_yield = 'Yield_Percentage' in filtered.columns
+
+    # Group columns
+    group_cols = ['Output_Material']
+    if has_output_grade:
+        group_cols.append('Output_Grade')
+
+    # Aggregate: count, and yield statistics if available
+    agg_dict = {'Output_Material': 'count'}  # This gives us Order_Count
+
+    if has_yield:
+        # Calculate yield statistics per group
+        yield_stats = filtered.groupby(group_cols).agg({
+            'Yield_Percentage': ['mean', 'std', 'count']
+        }).reset_index()
+
+        # Flatten column names
+        yield_stats.columns = group_cols + ['Avg_Yield', 'Yield_Std', 'Order_Count']
+
+        # Fill NaN std with 0 (for groups with only 1 record)
+        yield_stats['Yield_Std'] = yield_stats['Yield_Std'].fillna(0)
+
+        # Round values
+        yield_stats['Avg_Yield'] = yield_stats['Avg_Yield'].round(2)
+        yield_stats['Yield_Std'] = yield_stats['Yield_Std'].round(2)
+
+        output_counts = yield_stats
+    else:
+        # No yield data - just count
+        output_counts = filtered.groupby(group_cols).size().reset_index(name='Order_Count')
+        output_counts['Avg_Yield'] = 0.0
+        output_counts['Yield_Std'] = 0.0
+
+    # Add Output_Grade column if not present
+    if not has_output_grade:
+        output_counts['Output_Grade'] = 'N/A'
 
     # Calculate percentages
     total_orders = output_counts['Order_Count'].sum()
     output_counts['Percentage'] = (output_counts['Order_Count'] / total_orders * 100).round(2)
 
-    # Sort by count descending
-    output_counts = output_counts.sort_values('Order_Count', ascending=False).reset_index(drop=True)
+    # Sort by Output_Material first, then by Order_Count descending within each material
+    output_counts = output_counts.sort_values(
+        ['Output_Material', 'Order_Count'],
+        ascending=[True, False]
+    ).reset_index(drop=True)
+
+    # Ensure column order
+    cols = ['Output_Material', 'Output_Grade', 'Order_Count', 'Percentage', 'Avg_Yield', 'Yield_Std']
+    output_counts = output_counts[[c for c in cols if c in output_counts.columns]]
 
     # Convert to list of dicts
     results = output_counts.to_dict('records')
@@ -993,11 +1036,11 @@ def calculate_kd_output_with_wastage(
     wastage_pct: float = 9.0
 ) -> Dict[str, Any]:
     """
-    Apply wastage and distribute expected output BF across KD materials.
+    Apply wastage and distribute expected output BF across KD materials and grades.
 
     Args:
         input_bf: Input board feet (e.g., 10000)
-        kd_distribution: List from get_historical_kd_distribution()
+        kd_distribution: List from get_historical_kd_distribution() (includes Output_Grade)
         wastage_pct: Wastage percentage (default 9.0)
 
     Returns:
@@ -1006,12 +1049,13 @@ def calculate_kd_output_with_wastage(
         - 'wastage_pct': Wastage percentage applied
         - 'wastage_bf': BF lost to wastage
         - 'available_bf': BF available after wastage
-        - 'kd_outputs': List of dicts with Expected_Output_BF added to each KD material
+        - 'kd_outputs': List of dicts with Expected_Output_BF added (includes Output_Grade)
         - 'total_expected_bf': Sum of all expected outputs (should equal available_bf)
 
     Example:
-        Input: 10,000 BF, 9% wastage, distribution = [{'Output_Material': '4PO3BKD', 'Percentage': 58.0}, ...]
-        Output: available_bf = 9,100, 4PO3BKD gets 5,278 BF (58% of 9,100)
+        Input: 10,000 BF, 9% wastage
+        Distribution: [{'Output_Material': '4PO3BKD', 'Output_Grade': '1C', 'Percentage': 34.0}, ...]
+        Output: available_bf = 9,100, 4PO3BKD-1C gets 3,094 BF (34% of 9,100)
     """
     if not kd_distribution:
         return {
@@ -1027,7 +1071,7 @@ def calculate_kd_output_with_wastage(
     wastage_bf = input_bf * (wastage_pct / 100)
     available_bf = input_bf - wastage_bf
 
-    # Distribute available BF across KD materials by percentage
+    # Distribute available BF across KD materials + grades by percentage
     kd_outputs = []
     total_expected = 0
 
@@ -1035,8 +1079,11 @@ def calculate_kd_output_with_wastage(
         expected_bf = available_bf * (kd['Percentage'] / 100)
         kd_output = {
             'Output_Material': kd['Output_Material'],
+            'Output_Grade': kd.get('Output_Grade', 'N/A'),
             'Order_Count': kd['Order_Count'],
             'Percentage': kd['Percentage'],
+            'Avg_Yield': kd.get('Avg_Yield', 0.0),  # Historical average yield %
+            'Yield_Std': kd.get('Yield_Std', 0.0),  # Yield standard deviation
             'Expected_Output_BF': round(expected_bf, 2)
         }
         kd_outputs.append(kd_output)

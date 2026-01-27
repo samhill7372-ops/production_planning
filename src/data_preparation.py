@@ -288,46 +288,67 @@ def aggregate_input_261(df_261: pd.DataFrame) -> pd.DataFrame:
 
 def aggregate_output_101(df_101: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate OUTPUT (101) data per MANUFACTURINGORDER.
+    Aggregate OUTPUT (101) data per MANUFACTURINGORDER and OUTPUT MATERIAL.
 
     SAP Logic for 101 (Goods Receipt):
     - 101 = finished goods RECEIVED into stock (OUTPUT from production)
-    - Sum BFOUT → Total_Output_BF (derived from dimensions)
-    - Collect unique output materials
+    - Sum BFOUT per (order, material) → Total_Output_BF
+    - Use DOMINANT grade (grade with highest BF) per material within each order
+    - MULTI-OUTPUT MODEL: Keep ALL output materials per order (not just dominant)
     """
     df = df_101.copy()
 
     # Derive BFOUT first
     df = derive_bfout_from_dimensions(df)
 
+    # Calculate dominant grade per (order, material) combination
+    # This ensures we get the correct grade when a material has multiple grades
+    def get_dominant_grade(group):
+        """Return grade with highest total BFOUT in the group."""
+        if 'TALLYGRADE' not in group.columns or 'BFOUT' not in group.columns:
+            return group['TALLYGRADE'].iloc[0] if 'TALLYGRADE' in group.columns else 'N/A'
+        grade_bf = group.groupby('TALLYGRADE')['BFOUT'].sum()
+        return grade_bf.idxmax() if len(grade_bf) > 0 else group['TALLYGRADE'].iloc[0]
+
+    # Group by (MANUFACTURINGORDER, MATERIAL) to keep all output materials
+    # Then get dominant grade per material
     agg_dict = {
         'BFOUT': 'sum',
     }
 
-    # Output material info
-    for col in ['MATERIAL', 'MATERIALSPECIE', 'TALLYGRADE']:
-        if col in df.columns:
-            agg_dict[col] = 'first'
+    # Species - first (same material should have same species)
+    if 'MATERIALSPECIE' in df.columns:
+        agg_dict['MATERIALSPECIE'] = 'first'
 
     # Dimensions - mean
     for col in ['MATERIALTHICKNESS', 'TALLYLENGTH', 'TALLYWIDTH']:
         if col in df.columns:
             agg_dict[col] = 'mean'
 
-    df_agg = df.groupby('MANUFACTURINGORDER').agg(agg_dict).reset_index()
+    # Aggregate by (order, material)
+    df_agg = df.groupby(['MANUFACTURINGORDER', 'MATERIAL']).agg(agg_dict).reset_index()
+
+    # Get dominant grade per (order, material)
+    dominant_grades = df.groupby(['MANUFACTURINGORDER', 'MATERIAL']).apply(
+        get_dominant_grade, include_groups=False
+    ).reset_index(name='Dominant_Grade')
+
+    # Merge dominant grades
+    df_agg = df_agg.merge(dominant_grades, on=['MANUFACTURINGORDER', 'MATERIAL'], how='left')
 
     # Rename for clarity
     df_agg.rename(columns={
         'BFOUT': 'Total_Output_BF',
         'MATERIAL': 'Output_Material',
         'MATERIALSPECIE': 'Output_Specie',
-        'TALLYGRADE': 'Output_Grade',
+        'Dominant_Grade': 'Output_Grade',
         'MATERIALTHICKNESS': 'Output_Thickness',
         'TALLYLENGTH': 'Output_Length',
         'TALLYWIDTH': 'Output_Width'
     }, inplace=True)
 
-    print(f"Aggregated 101 (OUTPUT - Goods Receipt): {len(df_agg):,} manufacturing orders")
+    print(f"Aggregated 101 (OUTPUT - Goods Receipt): {len(df_agg):,} output records")
+    print(f"Unique manufacturing orders: {df_agg['MANUFACTURINGORDER'].nunique():,}")
     print(f"Total Output BF: {df_agg['Total_Output_BF'].sum():,.0f}")
 
     return df_agg

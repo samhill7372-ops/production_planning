@@ -190,9 +190,29 @@ def load_model_artifacts(model_year: str = None):
 
 
 @st.cache_data
-def load_historical_data():
-    """Load and prepare historical data."""
-    # Option 1: Load from CSV files in data/ folder (local development)
+def load_historical_data(selected_year: str = None):
+    """Load and prepare historical data for the selected year.
+
+    Args:
+        selected_year: Year to load data for (e.g., '2024', '2025').
+                      If None, loads all available years.
+    """
+    # Determine which years to load
+    if selected_year:
+        years_to_load = [selected_year]
+    else:
+        years_to_load = get_available_years()
+
+    # Option 1: Load from year-specific CSV files
+    try:
+        df, encoders = prepare_full_dataset(years=years_to_load)
+        print(f"Loaded historical data for {years_to_load}: {len(df)} records")
+        print(f"Columns: {df.columns.tolist()}")
+        return df
+    except Exception as e:
+        print(f"Could not load year-specific data: {e}")
+
+    # Option 2: Try loading from generic CSV files (101.csv, 261.csv)
     try:
         csv_101 = os.path.join(DATA_DIR, "101.csv")
         csv_261 = os.path.join(DATA_DIR, "261.csv")
@@ -200,19 +220,18 @@ def load_historical_data():
             df, encoders = prepare_full_dataset(csv_261, csv_101)
             return df
     except Exception as e:
-        print(f"Could not load from CSV: {e}")
+        print(f"Could not load from generic CSV: {e}")
 
-    # Option 2: Load pre-computed historical summary from models/ folder
+    # Option 3: Load pre-computed historical summary from models/ folder
     try:
         hist_path = os.path.join(MODELS_DIR, "historical_summary.joblib")
         if os.path.exists(hist_path):
             historical_summary = joblib.load(hist_path)
-            # Rename columns to match expected format
             historical_summary = historical_summary.rename(columns={
                 'Mean_Yield': 'Yield_Percentage',
                 'Order_Count': 'Historical_Orders'
             })
-            print(f"Loaded historical_summary.joblib: {len(historical_summary)} input-output combinations")
+            print(f"Loaded historical_summary.joblib: {len(historical_summary)} records")
             return historical_summary
     except Exception as e:
         print(f"Could not load historical_summary: {e}")
@@ -777,50 +796,57 @@ def render_kd_material_lookup_section(options, historical_data):
         kd_outputs = result.get('kd_outputs', [])
 
         if kd_outputs:
+            # Sort by Expected BF descending (default)
+            kd_outputs = sorted(kd_outputs, key=lambda x: x['Expected_Output_BF'], reverse=True)
+
             # Create DataFrame for display
-            df_display = pd.DataFrame(kd_outputs)
+            df_table = pd.DataFrame(kd_outputs)
+
+            # Format the table for display
+            df_display = pd.DataFrame({
+                'KD Material': df_table['Output_Material'],
+                'Grade': df_table['Output_Grade'],
+                'Count': df_table['Order_Count'],
+                'Historical %': df_table['Percentage'].apply(lambda x: f"{x:.1f}%"),
+                'Avg Yield': df_table['Avg_Yield'].apply(lambda x: f"{x:.1f}%" if x > 0 else "N/A"),
+                'Expected BF': df_table['Expected_Output_BF'].apply(lambda x: f"{x:,.0f}")
+            })
+
+            # Display as a styled dataframe
+            st.dataframe(
+                df_display,
+                use_container_width=True,
+                hide_index=True,
+                height=min(400, 35 * len(df_display) + 38)
+            )
+
+            # Total row
+            total_orders = sum(kd['Order_Count'] for kd in kd_outputs)
+            st.markdown(f"**Total: {total_orders} orders | {result['available_bf']:,.0f} BF available**")
+
+            st.markdown("---")
+
+            # Selection for production order
+            st.markdown("**Select KD materials for production order:**")
 
             # Add selection checkboxes via session state
             if 'selected_kds' not in st.session_state:
                 st.session_state.selected_kds = []
 
-            # Display as interactive table
-            st.markdown("**Select KD material(s) to create production order:**")
-
-            # Create selection UI
             selected_kds = []
-            for i, kd in enumerate(kd_outputs):
-                col_check, col_mat, col_count, col_pct, col_bf = st.columns([0.5, 2, 1, 1, 1.5])
+            # Create selection with multiselect
+            material_options = [f"{kd['Output_Material']} | {kd['Output_Grade']} | {kd['Expected_Output_BF']:,.0f} BF" for kd in kd_outputs]
+            selected_items = st.multiselect(
+                "Select materials to include:",
+                options=material_options,
+                default=[],
+                key="kd_multiselect"
+            )
 
-                with col_check:
-                    is_selected = st.checkbox("", key=f"kd_select_{i}", label_visibility="collapsed")
-                    if is_selected:
-                        selected_kds.append(kd)
-
-                with col_mat:
-                    st.write(f"**{kd['Output_Material']}**")
-
-                with col_count:
-                    st.write(f"{kd['Order_Count']} orders")
-
-                with col_pct:
-                    st.write(f"{kd['Percentage']:.1f}%")
-
-                with col_bf:
-                    st.write(f"**{kd['Expected_Output_BF']:,.0f} BF**")
-
-            # Total row
-            st.markdown("---")
-            col_t1, col_t2, col_t3, col_t4, col_t5 = st.columns([0.5, 2, 1, 1, 1.5])
-            with col_t2:
-                st.write("**TOTAL**")
-            with col_t3:
-                total_orders = sum(kd['Order_Count'] for kd in kd_outputs)
-                st.write(f"**{total_orders}**")
-            with col_t4:
-                st.write("**100%**")
-            with col_t5:
-                st.write(f"**{result['available_bf']:,.0f} BF**")
+            # Map selections back to kd_outputs
+            for i, option in enumerate(material_options):
+                if option in selected_items:
+                    selected_kds.append(kd_outputs[i])
 
             # Store selected KDs
             st.session_state.selected_kds = selected_kds
@@ -849,7 +875,9 @@ def render_kd_material_lookup_section(options, historical_data):
                 for kd in selected_kds:
                     order_data.append({
                         'KD Material': kd['Output_Material'],
+                        'Grade': kd.get('Output_Grade', 'N/A'),
                         'Historical %': f"{kd['Percentage']:.1f}%",
+                        'Avg Yield': f"{kd.get('Avg_Yield', 0):.1f}%",
                         'Planned Output (BF)': f"{kd['Expected_Output_BF']:,.0f}"
                     })
 
@@ -868,7 +896,7 @@ def render_kd_material_lookup_section(options, historical_data):
                     'Selected_Outputs': selected_kds
                 }
 
-                # Create CSV for download
+                # Create CSV for download (includes Grade and Yield columns)
                 export_rows = []
                 for kd in selected_kds:
                     export_rows.append({
@@ -877,8 +905,11 @@ def render_kd_material_lookup_section(options, historical_data):
                         'Wastage_Pct': result['wastage_pct'],
                         'Available_Output_BF': result['available_bf'],
                         'Output_Material': kd['Output_Material'],
+                        'Output_Grade': kd.get('Output_Grade', 'N/A'),
                         'Historical_Order_Count': kd['Order_Count'],
                         'Historical_Percentage': kd['Percentage'],
+                        'Avg_Yield_Pct': kd.get('Avg_Yield', 0),
+                        'Yield_Std': kd.get('Yield_Std', 0),
                         'Planned_Output_BF': kd['Expected_Output_BF']
                     })
 
@@ -1647,58 +1678,11 @@ def main():
 
     # Load artifacts for selected model year
     artifacts = load_model_artifacts(selected_model_year)
-    # Load historical data (uses caching, will work locally with CSVs)
-    historical_data = load_historical_data()
+    # Load historical data for the selected year
+    historical_data = load_historical_data(selected_model_year)
 
     # Continue sidebar content
     with st.sidebar:
-        # =====================================================================
-        # MODEL TRAINING SECTION
-        # =====================================================================
-        st.header("Model Training")
-
-        # Get available years from data files
-        available_years = get_available_years()
-
-        if available_years:
-            # Year selection
-            selected_years = st.multiselect(
-                "Select years to train:",
-                options=available_years,
-                default=available_years,
-                help="Choose which year(s) of data to use for training"
-            )
-
-            # Train button
-            if st.button("Train Model", type="primary", use_container_width=True, disabled=len(selected_years) == 0):
-                with st.spinner(f"Training on {', '.join(selected_years)} data..."):
-                    try:
-                        df, encoders = prepare_full_dataset(years=selected_years)
-
-                        # Determine save path based on selected years
-                        # Single year: save to models/{year}/
-                        # Multiple years: save to root models/
-                        if len(selected_years) == 1:
-                            save_path = os.path.join(MODELS_DIR, selected_years[0])
-                        else:
-                            save_path = MODELS_DIR
-
-                        model = train_yield_model(df, encoders, save_path=save_path, years=selected_years)
-
-                        st.success(f"Trained on {', '.join(selected_years)}!")
-
-                        load_model_artifacts.clear()
-                        load_historical_data.clear()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Training failed: {e}")
-                        import traceback
-                        st.code(traceback.format_exc())
-        else:
-            st.warning("No data files found.")
-
-        st.markdown("---")
-
         # =====================================================================
         # CURRENT MODEL INFO SECTION
         # =====================================================================
@@ -1751,8 +1735,8 @@ def main():
             else:
                 st.warning("Output Classifier not trained")
         else:
-            st.warning("No model trained yet")
-            st.caption("Select years above and click 'Train Model' to get started")
+            st.warning("No model found for selected year")
+            st.caption("Please select a different year or ensure model files exist")
 
         st.markdown("---")
         st.markdown("""
