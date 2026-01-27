@@ -1,41 +1,26 @@
-# Large data files (exceed GitHub 100MB limit)
-data/261.csv
-models/all_classifiers.joblib
-
-# Large model files (over 50MB warning threshold)
-data/101.csv
-models/output_classifier.joblib
+# Data files (too large for GitHub)
+data/
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
-# Virtual environments
-.venv/
-.conda/
-venv/
+.Python
 env/
-ENV/
+venv/
+.env
 
 # IDE
-.idea/
 .vscode/
-*.swp
-*.swo
+.idea/
 
 # OS
 .DS_Store
 Thumbs.db
-nul
 
-# Byte-compiled / optimized / DLL files
-*.pyc
-*.pyo
-*.pyd
+# Jupyter
+.ipynb_checkpoints/
 
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
+# Local settings
+.claude/settings.local.json
