@@ -34,6 +34,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 # Import custom modules from src/
 from src.data_preparation import (
     prepare_full_dataset,
+    prepare_full_dataset_with_raw,
+    load_raw_csv_data,
     get_unique_materials_from_csv,
     get_historical_yield_by_material,
     get_available_years
@@ -196,6 +198,12 @@ def load_historical_data(selected_year: str = None):
     Args:
         selected_year: Year to load data for (e.g., '2024', '2025').
                       If None, loads all available years.
+
+    Returns:
+        Tuple of (historical_data, df_261_raw, df_101_raw)
+        - historical_data: Joined and encoded data (for distribution calculation)
+        - df_261_raw: RAW 261 CSV data (for accurate BFIN totals)
+        - df_101_raw: RAW 101 CSV data (for accurate BFOUT totals)
     """
     # Determine which years to load
     if selected_year:
@@ -203,12 +211,19 @@ def load_historical_data(selected_year: str = None):
     else:
         years_to_load = get_available_years()
 
+    # Load RAW CSV data for accurate totals (no cleaning/aggregation)
+    df_261_raw, df_101_raw = None, None
+    try:
+        df_261_raw, df_101_raw = load_raw_csv_data(years=years_to_load)
+    except Exception as e:
+        print(f"Could not load raw CSV data: {e}")
+
     # Option 1: Load from year-specific CSV files
     try:
         df, encoders = prepare_full_dataset(years=years_to_load)
         print(f"Loaded historical data for {years_to_load}: {len(df)} records")
         print(f"Columns: {df.columns.tolist()}")
-        return df
+        return df, df_261_raw, df_101_raw
     except Exception as e:
         print(f"Could not load year-specific data: {e}")
 
@@ -218,11 +233,11 @@ def load_historical_data(selected_year: str = None):
         csv_261 = os.path.join(DATA_DIR, "261.csv")
         if os.path.exists(csv_101) and os.path.exists(csv_261):
             df, encoders = prepare_full_dataset(csv_261, csv_101)
-            return df
+            return df, df_261_raw, df_101_raw
     except Exception as e:
         print(f"Could not load from generic CSV: {e}")
 
-    # Option 3: Load pre-computed historical summary from models/ folder
+    # Option 3: Load pre-computed historical summary from models/ folder (no raw data)
     try:
         hist_path = os.path.join(MODELS_DIR, "historical_summary.joblib")
         if os.path.exists(hist_path):
@@ -232,11 +247,11 @@ def load_historical_data(selected_year: str = None):
                 'Order_Count': 'Historical_Orders'
             })
             print(f"Loaded historical_summary.joblib: {len(historical_summary)} records")
-            return historical_summary
+            return historical_summary, df_261_raw, df_101_raw
     except Exception as e:
         print(f"Could not load historical_summary: {e}")
 
-    return None
+    return None, df_261_raw, df_101_raw
 
 
 @st.cache_data
@@ -634,8 +649,15 @@ def render_reverse_prediction_section(model, encoders, feature_columns, options)
                 st.table(pd.DataFrame(breakdown_data))
 
 
-def render_kd_material_lookup_section(options, historical_data):
-    """Render the KD Material Lookup section - find historical KD outputs for a KS input."""
+def render_kd_material_lookup_section(options, historical_data, df_261_raw=None, df_101_raw=None):
+    """Render the KD Material Lookup section - find historical KD outputs for a KS input.
+
+    Args:
+        options: Dropdown options dict
+        historical_data: Joined historical data (for distribution calculation)
+        df_261_raw: RAW 261 CSV data (for accurate BFIN totals matching notebook)
+        df_101_raw: RAW 101 CSV data (for accurate BFOUT totals matching notebook)
+    """
     st.subheader("KD Material Lookup: Find Output Materials")
     st.caption("Enter a KS (input) material to see which KD (output) materials it has historically produced")
 
@@ -745,7 +767,8 @@ def render_kd_material_lookup_section(options, historical_data):
                 historical_data=historical_data,
                 input_thickness=kd_thickness,
                 input_grade=kd_grade,
-                input_species=kd_specie
+                input_species=kd_specie,
+                input_plant=kd_plant
             )
 
             if not kd_distribution:
@@ -753,12 +776,55 @@ def render_kd_material_lookup_section(options, historical_data):
                 st.info("Try removing the optional filters (Thickness, Species, Grade) or selecting a different material.")
                 return
 
+            # Calculate total historical BF Input/Output using RAW CSV data
+            # This matches the notebook approach - no cleaning/aggregation
+            if df_261_raw is not None and df_101_raw is not None:
+                # Use RAW 261 data for BFIN (column names: MATERIAL, BFIN, PLANT, etc.)
+                filtered_261 = df_261_raw[df_261_raw['MATERIAL'] == kd_material].copy()
+                if kd_thickness is not None and 'MATERIALTHICKNESS' in filtered_261.columns:
+                    filtered_261 = filtered_261[filtered_261['MATERIALTHICKNESS'] == kd_thickness]
+                if kd_specie is not None and 'MATERIALSPECIE' in filtered_261.columns:
+                    filtered_261 = filtered_261[filtered_261['MATERIALSPECIE'] == kd_specie]
+                if kd_grade is not None and 'TALLYGRADE' in filtered_261.columns:
+                    filtered_261 = filtered_261[filtered_261['TALLYGRADE'] == kd_grade]
+                if kd_plant is not None and 'PLANT' in filtered_261.columns:
+                    filtered_261 = filtered_261[filtered_261['PLANT'] == kd_plant]
+                total_hist_input_bf = filtered_261['BFIN'].sum() if 'BFIN' in filtered_261.columns else 0
+
+                # Get MANUFACTURINGORDER list from filtered 261 data
+                order_list = filtered_261['MANUFACTURINGORDER'].unique() if 'MANUFACTURINGORDER' in filtered_261.columns else []
+
+                # Use RAW 101 data for BFOUT (column name: BFOUT)
+                if len(order_list) > 0:
+                    filtered_101 = df_101_raw[df_101_raw['MANUFACTURINGORDER'].isin(order_list)]
+                    total_hist_output_bf = filtered_101['BFOUT'].sum() if 'BFOUT' in filtered_101.columns else 0
+                else:
+                    total_hist_output_bf = 0
+            else:
+                # Fallback to joined data if raw data not available
+                filtered_hist = historical_data[historical_data['Input_Material'] == kd_material]
+                if kd_thickness is not None and 'Input_Thickness' in filtered_hist.columns:
+                    filtered_hist = filtered_hist[filtered_hist['Input_Thickness'] == kd_thickness]
+                if kd_specie is not None and 'Input_Specie' in filtered_hist.columns:
+                    filtered_hist = filtered_hist[filtered_hist['Input_Specie'] == kd_specie]
+                if kd_grade is not None and 'Input_Grade' in filtered_hist.columns:
+                    filtered_hist = filtered_hist[filtered_hist['Input_Grade'] == kd_grade]
+                if kd_plant is not None and 'Input_Plant' in filtered_hist.columns:
+                    filtered_hist = filtered_hist[filtered_hist['Input_Plant'] == kd_plant]
+                unique_orders = filtered_hist.drop_duplicates('MANUFACTURINGORDER') if 'MANUFACTURINGORDER' in filtered_hist.columns else filtered_hist
+                total_hist_input_bf = unique_orders['Total_Input_BF'].sum() if 'Total_Input_BF' in unique_orders.columns else 0
+                total_hist_output_bf = filtered_hist['Total_Output_BF'].sum() if 'Total_Output_BF' in filtered_hist.columns else 0
+
             # Calculate output with wastage
             result = calculate_kd_output_with_wastage(
                 input_bf=kd_input_bf,
                 kd_distribution=kd_distribution,
                 wastage_pct=kd_wastage
             )
+
+            # Add historical totals to result
+            result['total_hist_input_bf'] = total_hist_input_bf
+            result['total_hist_output_bf'] = total_hist_output_bf
 
             # Store in session state
             st.session_state.kd_lookup_result = result
@@ -788,6 +854,20 @@ def render_kd_material_lookup_section(options, historical_data):
         with col_s4:
             st.metric("Available for Output", f"{result['available_bf']:,.0f} BF")
 
+        # Historical BF Totals (new row)
+        st.markdown("**Historical Data Summary:**")
+        col_h1, col_h2, col_h3 = st.columns(3)
+
+        with col_h1:
+            st.metric("Total BF Input (Historical)", f"{result.get('total_hist_input_bf', 0):,.0f}")
+
+        with col_h2:
+            st.metric("Total BF Output (Historical)", f"{result.get('total_hist_output_bf', 0):,.0f}")
+
+        with col_h3:
+            hist_yield = (result.get('total_hist_output_bf', 0) / result.get('total_hist_input_bf', 1)) * 100 if result.get('total_hist_input_bf', 0) > 0 else 0
+            st.metric("Historical Yield", f"{hist_yield:.1f}%")
+
         st.markdown("---")
 
         # KD Materials Table
@@ -806,7 +886,7 @@ def render_kd_material_lookup_section(options, historical_data):
             df_display = pd.DataFrame({
                 'KD Material': df_table['Output_Material'],
                 'Grade': df_table['Output_Grade'],
-                'Count': df_table['Order_Count'],
+                'BF Output': df_table['BF_Output'].apply(lambda x: f"{x:,.0f}"),
                 'Historical %': df_table['Percentage'].apply(lambda x: f"{x:.1f}%"),
                 'Avg Yield': df_table['Avg_Yield'].apply(lambda x: f"{x:.1f}%" if x > 0 else "N/A"),
                 'Expected BF': df_table['Expected_Output_BF'].apply(lambda x: f"{x:,.0f}")
@@ -820,9 +900,9 @@ def render_kd_material_lookup_section(options, historical_data):
                 height=min(400, 35 * len(df_display) + 38)
             )
 
-            # Total row
-            total_orders = sum(kd['Order_Count'] for kd in kd_outputs)
-            st.markdown(f"**Total: {total_orders} orders | {result['available_bf']:,.0f} BF available**")
+            # Total row - show total historical BF output
+            total_bf_output = sum(kd['BF_Output'] for kd in kd_outputs)
+            st.markdown(f"**Total Historical BF Output: {total_bf_output:,.0f} | Available BF: {result['available_bf']:,.0f}**")
 
             st.markdown("---")
 
@@ -906,7 +986,8 @@ def render_kd_material_lookup_section(options, historical_data):
                         'Available_Output_BF': result['available_bf'],
                         'Output_Material': kd['Output_Material'],
                         'Output_Grade': kd.get('Output_Grade', 'N/A'),
-                        'Historical_Order_Count': kd['Order_Count'],
+                        'Historical_BF_Output': kd.get('BF_Output', 0),
+                        'Historical_Order_Count': kd.get('Order_Count', 0),
                         'Historical_Percentage': kd['Percentage'],
                         'Avg_Yield_Pct': kd.get('Avg_Yield', 0),
                         'Yield_Std': kd.get('Yield_Std', 0),
@@ -1653,6 +1734,12 @@ def render_test_results(test_results: pd.DataFrame):
 
 def main():
     """Main application entry point."""
+    # Clear cached data to pick up code changes (especially for raw CSV loading)
+    # This ensures df_261_raw and df_101_raw are properly loaded
+    if 'cache_cleared' not in st.session_state:
+        st.cache_data.clear()
+        st.session_state.cache_cleared = True
+
     st.markdown('<h1 class="main-header">Production Planning - Material Yield Prediction</h1>',
                 unsafe_allow_html=True)
 
@@ -1678,8 +1765,8 @@ def main():
 
     # Load artifacts for selected model year
     artifacts = load_model_artifacts(selected_model_year)
-    # Load historical data for the selected year
-    historical_data = load_historical_data(selected_model_year)
+    # Load historical data for the selected year (also returns raw 261/101 data for KD lookup)
+    historical_data, df_261_raw, df_101_raw = load_historical_data(selected_model_year)
 
     # Continue sidebar content
     with st.sidebar:
@@ -1782,7 +1869,7 @@ def main():
 
     if prediction_mode == "KD Material Lookup (Find KD Outputs)":
         # KD Material Lookup Section
-        render_kd_material_lookup_section(options, historical_data)
+        render_kd_material_lookup_section(options, historical_data, df_261_raw, df_101_raw)
         return  # Exit early for KD lookup mode
 
     if prediction_mode == "Reverse Prediction (Output -> Input)":

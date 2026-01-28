@@ -131,6 +131,50 @@ def load_csv_files(
     return df_261, df_101
 
 
+def load_raw_csv_data(years: List[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load RAW 261 and 101 CSV data with minimal processing.
+
+    This function loads the CSV files and only does:
+    - Standardize column names (uppercase)
+    - Convert MANUFACTURINGORDER to string
+    - Convert BFIN/BFOUT to numeric
+
+    It does NOT:
+    - Remove IS_DELETED records
+    - Aggregate data
+    - Apply any other filtering
+
+    Used for accurate historical totals in KD lookup to match notebook calculations.
+
+    Returns:
+        Tuple of (df_261_raw, df_101_raw) DataFrames
+    """
+    # Load CSV files
+    df_261, df_101 = load_csv_files(years=years)
+
+    # Minimal processing for 261
+    df_261.columns = df_261.columns.str.upper().str.strip()
+    if 'MANUFACTURINGORDER' in df_261.columns:
+        df_261['MANUFACTURINGORDER'] = df_261['MANUFACTURINGORDER'].astype(str).str.strip()
+    if 'BFIN' in df_261.columns:
+        df_261['BFIN'] = pd.to_numeric(df_261['BFIN'], errors='coerce').fillna(0)
+    if 'MATERIALTHICKNESS' in df_261.columns:
+        df_261['MATERIALTHICKNESS'] = pd.to_numeric(df_261['MATERIALTHICKNESS'], errors='coerce').fillna(0)
+
+    # Minimal processing for 101
+    df_101.columns = df_101.columns.str.upper().str.strip()
+    if 'MANUFACTURINGORDER' in df_101.columns:
+        df_101['MANUFACTURINGORDER'] = df_101['MANUFACTURINGORDER'].astype(str).str.strip()
+    if 'BFOUT' in df_101.columns:
+        df_101['BFOUT'] = pd.to_numeric(df_101['BFOUT'], errors='coerce').fillna(0)
+
+    print(f"Loaded RAW 261: {len(df_261):,} rows, BFIN total: {df_261['BFIN'].sum():,.0f}")
+    print(f"Loaded RAW 101: {len(df_101):,} rows, BFOUT total: {df_101['BFOUT'].sum():,.0f}")
+
+    return df_261, df_101
+
+
 def clean_dataframe(df: pd.DataFrame, df_name: str) -> pd.DataFrame:
     """
     Clean dataframe: standardize column names, convert types.
@@ -670,6 +714,86 @@ def prepare_full_dataset(
     print("=" * 70)
 
     return df_encoded, encoders
+
+
+def prepare_full_dataset_with_raw(
+    input_261_path: str = None,
+    output_101_path: str = None,
+    remove_yield_outliers: bool = True,
+    years: List[str] = None
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, LabelEncoder]]:
+    """
+    Complete data preparation pipeline that ALSO returns raw aggregated dataframes.
+
+    This variant returns the pre-join aggregated data (df_input_agg, df_output_agg)
+    in addition to the joined data. Useful for calculating totals that include
+    orders without matches (e.g., KD lookup historical totals).
+
+    Returns:
+        Tuple of (df_joined, df_input_agg, df_output_agg, encoders)
+        - df_joined: Joined and encoded data (same as prepare_full_dataset)
+        - df_input_agg: Aggregated 261 data before join (all input orders)
+        - df_output_agg: Aggregated 101 data before join (all output orders)
+        - encoders: Label encoders for categorical columns
+    """
+    print("=" * 70)
+    print("DATA PREPARATION PIPELINE WITH RAW (SAP Manufacturing Logic)")
+    print("=" * 70)
+
+    # Step 1: Load CSV files
+    print("\n[1] Loading CSV files...")
+    if years:
+        print(f"Loading data for years: {years}")
+    df_261, df_101 = load_csv_files(input_261_path, output_101_path, years=years)
+
+    # Step 2: Clean dataframes
+    print("\n[2] Cleaning dataframes...")
+    df_261 = clean_dataframe(df_261, "261 (INPUT - Goods Issue)")
+    df_101 = clean_dataframe(df_101, "101 (OUTPUT - Goods Receipt)")
+
+    # Step 3: Aggregate INPUT per manufacturing order (261 = Goods Issue)
+    print("\n[3] Aggregating INPUT (261 - Goods Issue) per manufacturing order...")
+    df_input_agg = aggregate_input_261(df_261)
+
+    # Step 4: Aggregate OUTPUT per manufacturing order (101 = Goods Receipt)
+    print("\n[4] Aggregating OUTPUT (101 - Goods Receipt) per manufacturing order...")
+    df_output_agg = aggregate_output_101(df_101)
+
+    # Step 5: Join ONLY on MANUFACTURINGORDER
+    print("\n[5] Joining on MANUFACTURINGORDER...")
+    df_joined = join_input_output_by_order(df_input_agg, df_output_agg)
+
+    # Step 6: Calculate Yield
+    print("\n[6] Calculating Yield Percentage...")
+    df_joined = calculate_yield(df_joined)
+
+    # Step 7: Remove outliers (only from joined data, not raw)
+    if remove_yield_outliers:
+        print("\n[7] Removing outliers...")
+        df_joined = remove_outliers(df_joined, 'Yield_Percentage', 1, 99)
+        df_joined = remove_outliers(df_joined, 'Total_Input_BF', 1, 99)
+        df_joined = remove_outliers(df_joined, 'Total_Output_BF', 1, 99)
+
+    # Step 8: Encode categorical features
+    print("\n[8] Encoding categorical features...")
+    categorical_cols = ['Input_Material', 'Input_Specie', 'Input_Grade', 'Input_Plant',
+                        'Output_Material', 'Output_Specie', 'Output_Grade']
+    categorical_cols = [c for c in categorical_cols if c in df_joined.columns]
+
+    df_encoded, encoders = encode_categorical(df_joined, categorical_cols)
+
+    # Fill any remaining missing values
+    for col in df_encoded.select_dtypes(include=[np.number]).columns:
+        if df_encoded[col].isnull().any():
+            df_encoded[col].fillna(df_encoded[col].median(), inplace=True)
+
+    print("\n" + "=" * 70)
+    print(f"PREPARATION COMPLETE: {len(df_encoded):,} joined records")
+    print(f"Raw 261 (input): {len(df_input_agg):,} orders")
+    print(f"Raw 101 (output): {len(df_output_agg):,} records")
+    print("=" * 70)
+
+    return df_encoded, df_input_agg, df_output_agg, encoders
 
 
 def get_feature_columns() -> List[str]:

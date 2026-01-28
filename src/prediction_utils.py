@@ -361,7 +361,9 @@ def simulate_output_materials(
 
         # Calculate actual historical output for reference
         hist_total_output = output_hist['Total_Output_BF'].sum() if 'Total_Output_BF' in output_hist.columns else 0
-        hist_total_input = output_hist['Total_Input_BF'].sum() if 'Total_Input_BF' in output_hist.columns else 0
+        # Sum Input BF only once per unique order (avoid duplication from multiple output materials per order)
+        unique_orders = output_hist.drop_duplicates('MANUFACTURINGORDER') if 'MANUFACTURINGORDER' in output_hist.columns else output_hist
+        hist_total_input = unique_orders['Total_Input_BF'].sum() if 'Total_Input_BF' in unique_orders.columns else 0
         hist_avg_output = output_hist['Total_Output_BF'].mean() if 'Total_Output_BF' in output_hist.columns else 0
 
         results.append({
@@ -799,7 +801,9 @@ def simulate_output_materials_enhanced(
 
         # Historical totals
         hist_total_output = output_hist['Total_Output_BF'].sum() if 'Total_Output_BF' in output_hist.columns else 0
-        hist_total_input = output_hist['Total_Input_BF'].sum() if 'Total_Input_BF' in output_hist.columns else 0
+        # Sum Input BF only once per unique order (avoid duplication from multiple output materials per order)
+        unique_orders_hist = output_hist.drop_duplicates('MANUFACTURINGORDER') if 'MANUFACTURINGORDER' in output_hist.columns else output_hist
+        hist_total_input = unique_orders_hist['Total_Input_BF'].sum() if 'Total_Input_BF' in unique_orders_hist.columns else 0
         hist_avg_output = output_hist['Total_Output_BF'].mean() if 'Total_Output_BF' in output_hist.columns else 0
 
         # Recommendation score (combines yield and confidence)
@@ -924,26 +928,28 @@ def get_historical_kd_distribution(
     historical_data: pd.DataFrame,
     input_thickness: float = None,
     input_grade: str = None,
-    input_species: str = None
+    input_species: str = None,
+    input_plant: str = None
 ) -> List[Dict[str, Any]]:
     """
     Get historical distribution of KD (output) materials WITH GRADE breakdown and YIELD statistics.
 
     This is a historical lookup showing which output materials and grades have historically
-    been produced from this input, along with their average yield percentages.
+    been produced from this input, along with their BF output and average yield percentages.
 
     Args:
         input_material: Input material code (e.g., "4PO3BKS")
-        historical_data: DataFrame with joined 261+101 data (must have Input_Material, Output_Material, Output_Grade, Yield_Percentage columns)
+        historical_data: DataFrame with joined 261+101 data (must have Input_Material, Output_Material, Output_Grade, Yield_Percentage, Total_Output_BF columns)
         input_thickness: Optional filter by thickness
         input_grade: Optional filter by grade
         input_species: Optional filter by species
+        input_plant: Optional filter by plant
 
     Returns:
-        List of dicts sorted by Output_Material then count descending:
+        List of dicts sorted by Output_Material then BF_Output descending:
         [
-            {'Output_Material': '4PO3BKD', 'Output_Grade': '3B', 'Order_Count': 39, 'Percentage': 34.0, 'Avg_Yield': 92.5, 'Yield_Std': 2.3},
-            {'Output_Material': '4PO3BKD', 'Output_Grade': 'PR', 'Order_Count': 1, 'Percentage': 0.9, 'Avg_Yield': 88.1, 'Yield_Std': 0.0},
+            {'Output_Material': '4PO3BKD', 'Output_Grade': '3B', 'BF_Output': 10000.0, 'Order_Count': 39, 'Percentage': 34.0, 'Avg_Yield': 92.5, 'Yield_Std': 2.3},
+            {'Output_Material': '4PO3BKD', 'Output_Grade': 'PR', 'BF_Output': 500.0, 'Order_Count': 1, 'Percentage': 0.9, 'Avg_Yield': 88.1, 'Yield_Std': 0.0},
             ...
         ]
         Returns empty list if no historical data found.
@@ -968,64 +974,100 @@ def get_historical_kd_distribution(
     if input_species is not None and 'Input_Specie' in filtered.columns:
         filtered = filtered[filtered['Input_Specie'] == input_species]
 
+    if input_plant is not None and 'Input_Plant' in filtered.columns:
+        filtered = filtered[filtered['Input_Plant'] == input_plant]
+
     if len(filtered) == 0:
         return []
 
-    # Check if Output_Grade and Yield_Percentage columns exist
+    # Check if required columns exist
     has_output_grade = 'Output_Grade' in filtered.columns
     has_yield = 'Yield_Percentage' in filtered.columns
+    has_bf_output = 'Total_Output_BF' in filtered.columns
 
     # Group columns
     group_cols = ['Output_Material']
     if has_output_grade:
         group_cols.append('Output_Grade')
 
-    # Aggregate: count, and yield statistics if available
-    agg_dict = {'Output_Material': 'count'}  # This gives us Order_Count
+    # Build aggregation dictionary
+    agg_dict = {}
+
+    if has_bf_output:
+        agg_dict['Total_Output_BF'] = 'sum'
 
     if has_yield:
-        # Calculate yield statistics per group
-        yield_stats = filtered.groupby(group_cols).agg({
-            'Yield_Percentage': ['mean', 'std', 'count']
-        }).reset_index()
+        agg_dict['Yield_Percentage'] = ['mean', 'std', 'count']
+
+    # Perform aggregation
+    if has_yield:
+        # Calculate yield statistics and BF output per group
+        agg_cols = {}
+        if has_bf_output:
+            agg_cols['Total_Output_BF'] = 'sum'
+        agg_cols['Yield_Percentage'] = ['mean', 'std', 'count']
+
+        output_stats = filtered.groupby(group_cols).agg(agg_cols).reset_index()
 
         # Flatten column names
-        yield_stats.columns = group_cols + ['Avg_Yield', 'Yield_Std', 'Order_Count']
+        new_cols = list(group_cols)
+        if has_bf_output:
+            new_cols.append('BF_Output')
+        new_cols.extend(['Avg_Yield', 'Yield_Std', 'Order_Count'])
+        output_stats.columns = new_cols
 
         # Fill NaN std with 0 (for groups with only 1 record)
-        yield_stats['Yield_Std'] = yield_stats['Yield_Std'].fillna(0)
+        output_stats['Yield_Std'] = output_stats['Yield_Std'].fillna(0)
 
         # Round values
-        yield_stats['Avg_Yield'] = yield_stats['Avg_Yield'].round(2)
-        yield_stats['Yield_Std'] = yield_stats['Yield_Std'].round(2)
-
-        output_counts = yield_stats
+        output_stats['Avg_Yield'] = output_stats['Avg_Yield'].round(2)
+        output_stats['Yield_Std'] = output_stats['Yield_Std'].round(2)
+        if has_bf_output:
+            output_stats['BF_Output'] = output_stats['BF_Output'].round(2)
     else:
-        # No yield data - just count
-        output_counts = filtered.groupby(group_cols).size().reset_index(name='Order_Count')
-        output_counts['Avg_Yield'] = 0.0
-        output_counts['Yield_Std'] = 0.0
+        # No yield data
+        if has_bf_output:
+            output_stats = filtered.groupby(group_cols).agg({
+                'Total_Output_BF': 'sum'
+            }).reset_index()
+            output_stats.rename(columns={'Total_Output_BF': 'BF_Output'}, inplace=True)
+            output_stats['BF_Output'] = output_stats['BF_Output'].round(2)
+            output_stats['Order_Count'] = filtered.groupby(group_cols).size().values
+        else:
+            output_stats = filtered.groupby(group_cols).size().reset_index(name='Order_Count')
+            output_stats['BF_Output'] = 0.0
+        output_stats['Avg_Yield'] = 0.0
+        output_stats['Yield_Std'] = 0.0
+
+    # Add BF_Output column if not present
+    if 'BF_Output' not in output_stats.columns:
+        output_stats['BF_Output'] = 0.0
 
     # Add Output_Grade column if not present
     if not has_output_grade:
-        output_counts['Output_Grade'] = 'N/A'
+        output_stats['Output_Grade'] = 'N/A'
 
-    # Calculate percentages
-    total_orders = output_counts['Order_Count'].sum()
-    output_counts['Percentage'] = (output_counts['Order_Count'] / total_orders * 100).round(2)
+    # Calculate percentages based on BF Output (not count)
+    total_bf_output = output_stats['BF_Output'].sum()
+    if total_bf_output > 0:
+        output_stats['Percentage'] = (output_stats['BF_Output'] / total_bf_output * 100).round(2)
+    else:
+        # Fallback to count-based if no BF data
+        total_orders = output_stats['Order_Count'].sum()
+        output_stats['Percentage'] = (output_stats['Order_Count'] / total_orders * 100).round(2) if total_orders > 0 else 0.0
 
-    # Sort by Output_Material first, then by Order_Count descending within each material
-    output_counts = output_counts.sort_values(
-        ['Output_Material', 'Order_Count'],
+    # Sort by Output_Material first, then by BF_Output descending within each material
+    output_stats = output_stats.sort_values(
+        ['Output_Material', 'BF_Output'],
         ascending=[True, False]
     ).reset_index(drop=True)
 
-    # Ensure column order
-    cols = ['Output_Material', 'Output_Grade', 'Order_Count', 'Percentage', 'Avg_Yield', 'Yield_Std']
-    output_counts = output_counts[[c for c in cols if c in output_counts.columns]]
+    # Ensure column order - BF_Output replaces Order_Count as primary metric, but keep Order_Count for confidence
+    cols = ['Output_Material', 'Output_Grade', 'BF_Output', 'Order_Count', 'Percentage', 'Avg_Yield', 'Yield_Std']
+    output_stats = output_stats[[c for c in cols if c in output_stats.columns]]
 
     # Convert to list of dicts
-    results = output_counts.to_dict('records')
+    results = output_stats.to_dict('records')
 
     return results
 
@@ -1080,7 +1122,8 @@ def calculate_kd_output_with_wastage(
         kd_output = {
             'Output_Material': kd['Output_Material'],
             'Output_Grade': kd.get('Output_Grade', 'N/A'),
-            'Order_Count': kd['Order_Count'],
+            'BF_Output': kd.get('BF_Output', 0.0),  # Historical BF output
+            'Order_Count': kd.get('Order_Count', 0),
             'Percentage': kd['Percentage'],
             'Avg_Yield': kd.get('Avg_Yield', 0.0),  # Historical average yield %
             'Yield_Std': kd.get('Yield_Std', 0.0),  # Yield standard deviation
