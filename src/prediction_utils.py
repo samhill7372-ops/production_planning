@@ -1140,3 +1140,264 @@ def calculate_kd_output_with_wastage(
         'kd_outputs': kd_outputs,
         'total_expected_bf': round(total_expected, 2)
     }
+
+
+# =============================================================================
+# MATERIAL LEVEL FORWARD PREDICTION - YIELD RECOMMENDATION ENGINE
+# =============================================================================
+
+def get_material_level_forward_prediction(
+    ks_material: str,
+    plant: str,
+    input_bf: float,
+    df_261_raw: pd.DataFrame,
+    df_101_raw: pd.DataFrame,
+    min_order_count: int = 5
+) -> Dict[str, Any]:
+    """
+    Material-level forward prediction (Yield Recommendation Engine).
+
+    Given KS material, plant and input BF, predicts:
+    - Total output BF based on historical yield
+    - Distribution across KD materials (summing to 100%)
+
+    Args:
+        ks_material: Input KS material code
+        plant: Production plant
+        input_bf: User-entered BF IN quantity
+        df_261_raw: RAW 261 CSV data (movement type 261 - input)
+        df_101_raw: RAW 101 CSV data (movement type 101 - output)
+        min_order_count: Minimum orders for KD material inclusion (default 5)
+
+    Returns:
+        Dict with prediction results and KD material distribution
+    """
+    # Step 1: Filter 261 data by KS Material + Plant
+    filtered_261 = df_261_raw[
+        (df_261_raw['MATERIAL'] == ks_material) &
+        (df_261_raw['PLANT'] == plant)
+    ].copy()
+
+    if len(filtered_261) == 0:
+        return {
+            'error': f'No data found for KS Material: {ks_material} at Plant: {plant}',
+            'ks_material': ks_material,
+            'plant': plant
+        }
+
+    # Step 2: Get unique manufacturing orders
+    order_list = filtered_261['MANUFACTURINGORDER'].unique()
+
+    # Step 3: Calculate total historical BFIN
+    total_hist_input_bf = filtered_261['BFIN'].sum()
+
+    # Step 4: Find all KD output records for these orders (from 101)
+    filtered_101 = df_101_raw[df_101_raw['MANUFACTURINGORDER'].isin(order_list)].copy()
+
+    if len(filtered_101) == 0:
+        return {
+            'error': 'No KD output data found for this KS material',
+            'ks_material': ks_material,
+            'plant': plant
+        }
+
+    # Step 5: Calculate total historical BFOUT
+    total_hist_output_bf = filtered_101['BFOUT'].sum()
+
+    # Step 6: Calculate historical yield
+    historical_yield_pct = (total_hist_output_bf / total_hist_input_bf * 100) if total_hist_input_bf > 0 else 0
+
+    # Step 7: Calculate predicted output
+    predicted_output_bf = input_bf * (historical_yield_pct / 100)
+
+    # Step 8: Aggregate KD materials by historical BFOUT
+    output_agg = filtered_101.groupby('MATERIAL').agg({
+        'BFOUT': 'sum',
+        'MANUFACTURINGORDER': 'nunique'
+    }).reset_index()
+    output_agg.columns = ['KD_Material', 'Historical_BF_Output', 'Order_Count']
+
+    # Step 9: Filter to KD materials with > min_order_count orders
+    output_agg = output_agg[output_agg['Order_Count'] > min_order_count]
+
+    if len(output_agg) == 0:
+        return {
+            'error': f'No KD materials found with > {min_order_count} orders',
+            'ks_material': ks_material,
+            'plant': plant,
+            'total_orders': len(order_list)
+        }
+
+    # Step 10: Calculate percentage distribution (by historical BF output)
+    total_filtered_bf = output_agg['Historical_BF_Output'].sum()
+    output_agg['Contribution_Pct'] = (output_agg['Historical_BF_Output'] / total_filtered_bf * 100).round(2)
+
+    # Step 11: Calculate expected output BF per KD material
+    output_agg['Expected_BF_Output'] = (predicted_output_bf * output_agg['Contribution_Pct'] / 100).round(2)
+
+    # Sort by Contribution_Pct descending
+    output_agg = output_agg.sort_values('Contribution_Pct', ascending=False)
+
+    return {
+        'ks_material': ks_material,
+        'plant': plant,
+        'input_bf': input_bf,
+        'total_hist_input_bf': round(total_hist_input_bf, 2),
+        'total_hist_output_bf': round(total_hist_output_bf, 2),
+        'historical_yield_pct': round(historical_yield_pct, 2),
+        'predicted_output_bf': round(predicted_output_bf, 2),
+        'total_orders': len(order_list),
+        'kd_materials_count': len(output_agg),
+        'kd_distribution': output_agg.to_dict('records')
+    }
+
+
+def get_advanced_forward_prediction(
+    ks_material: str,
+    plant: str,
+    input_bf: float,
+    df_261_raw: pd.DataFrame,
+    df_101_raw: pd.DataFrame,
+    model,
+    encoders: Dict,
+    feature_columns: List[str],
+    min_order_count: int = 5
+) -> Dict[str, Any]:
+    """
+    Advanced forward prediction using ML model for yield + statistical distribution.
+
+    Uses trained ML model (YieldPredictionModel) for yield prediction,
+    combined with historical data for KD material distribution.
+
+    Args:
+        ks_material: Input KS material code
+        plant: Production plant
+        input_bf: User-entered BF IN quantity
+        df_261_raw: RAW 261 CSV data
+        df_101_raw: RAW 101 CSV data
+        model: Trained YieldPredictionModel
+        encoders: LabelEncoders for categorical features
+        feature_columns: Feature columns used by model
+        min_order_count: Minimum orders for KD material inclusion
+
+    Returns:
+        Dict with ML-based prediction and KD distribution
+    """
+    # Step 1: Filter 261 data by KS Material + Plant
+    filtered_261 = df_261_raw[
+        (df_261_raw['MATERIAL'] == ks_material) &
+        (df_261_raw['PLANT'] == plant)
+    ].copy()
+
+    if len(filtered_261) == 0:
+        return {
+            'error': f'No data found for KS Material: {ks_material} at Plant: {plant}',
+            'ks_material': ks_material,
+            'plant': plant
+        }
+
+    # Step 2: Get historical stats for context
+    order_list = filtered_261['MANUFACTURINGORDER'].unique()
+    total_hist_input_bf = filtered_261['BFIN'].sum()
+
+    # Step 3: Get output data
+    filtered_101 = df_101_raw[df_101_raw['MANUFACTURINGORDER'].isin(order_list)].copy()
+
+    if len(filtered_101) == 0:
+        return {
+            'error': 'No KD output data found for this KS material',
+            'ks_material': ks_material,
+            'plant': plant
+        }
+
+    total_hist_output_bf = filtered_101['BFOUT'].sum()
+    historical_yield_pct = (total_hist_output_bf / total_hist_input_bf * 100) if total_hist_input_bf > 0 else 0
+
+    # Step 4: Get average input characteristics for ML prediction
+    avg_thickness = filtered_261['MATERIALTHICKNESS'].mean() if 'MATERIALTHICKNESS' in filtered_261.columns else 4.0
+    avg_length = filtered_261['TALLYLENGTH'].mean() if 'TALLYLENGTH' in filtered_261.columns else 96.0
+    avg_width = filtered_261['TALLYWIDTH'].mean() if 'TALLYWIDTH' in filtered_261.columns else 8.0
+
+    # Get most common specie and grade
+    most_common_specie = 'SM'
+    if 'MATERIALSPECIE' in filtered_261.columns and len(filtered_261['MATERIALSPECIE'].dropna()) > 0:
+        specie_mode = filtered_261['MATERIALSPECIE'].mode()
+        if len(specie_mode) > 0:
+            most_common_specie = specie_mode.iloc[0]
+
+    most_common_grade = '2C'
+    if 'TALLYGRADE' in filtered_261.columns and len(filtered_261['TALLYGRADE'].dropna()) > 0:
+        grade_mode = filtered_261['TALLYGRADE'].mode()
+        if len(grade_mode) > 0:
+            most_common_grade = grade_mode.iloc[0]
+
+    # Step 5: Use ML model to predict yield
+    input_data = {
+        'Input_Plant': plant,
+        'Input_Material': ks_material,
+        'Input_Thickness': avg_thickness,
+        'Input_Specie': most_common_specie,
+        'Input_Grade': most_common_grade,
+        'Input_Length': avg_length,
+        'Input_Width': avg_width,
+        'Total_Input_BF': input_bf
+    }
+
+    ml_yield_pct = historical_yield_pct  # Default fallback
+    ml_confidence = 'LOW'
+    prediction_method = 'Statistical (ML fallback)'
+
+    try:
+        if model is not None:
+            ml_prediction = forward_predict(model, input_data, encoders, feature_columns)
+            ml_yield_pct = ml_prediction['predicted_yield_pct']
+            ml_confidence = ml_prediction.get('confidence', 'MEDIUM')
+            prediction_method = 'ML Model + Statistical Distribution'
+    except Exception as e:
+        # Fallback to historical if ML fails
+        ml_yield_pct = historical_yield_pct
+        ml_confidence = 'LOW (ML unavailable)'
+        prediction_method = 'Statistical (ML error)'
+
+    # Step 6: Calculate predicted output using ML yield
+    predicted_output_bf = input_bf * (ml_yield_pct / 100)
+
+    # Step 7: Get KD distribution (statistical - same as material level)
+    output_agg = filtered_101.groupby('MATERIAL').agg({
+        'BFOUT': 'sum',
+        'MANUFACTURINGORDER': 'nunique'
+    }).reset_index()
+    output_agg.columns = ['KD_Material', 'Historical_BF_Output', 'Order_Count']
+
+    # Filter to KD materials with > min_order_count
+    output_agg = output_agg[output_agg['Order_Count'] > min_order_count]
+
+    if len(output_agg) == 0:
+        return {
+            'error': f'No KD materials found with > {min_order_count} orders',
+            'ks_material': ks_material,
+            'plant': plant,
+            'total_orders': len(order_list)
+        }
+
+    # Calculate distribution
+    total_filtered_bf = output_agg['Historical_BF_Output'].sum()
+    output_agg['Contribution_Pct'] = (output_agg['Historical_BF_Output'] / total_filtered_bf * 100).round(2)
+    output_agg['Expected_BF_Output'] = (predicted_output_bf * output_agg['Contribution_Pct'] / 100).round(2)
+    output_agg = output_agg.sort_values('Contribution_Pct', ascending=False)
+
+    return {
+        'ks_material': ks_material,
+        'plant': plant,
+        'input_bf': input_bf,
+        'total_hist_input_bf': round(total_hist_input_bf, 2),
+        'total_hist_output_bf': round(total_hist_output_bf, 2),
+        'historical_yield_pct': round(historical_yield_pct, 2),
+        'ml_yield_pct': round(ml_yield_pct, 2),
+        'ml_confidence': ml_confidence,
+        'predicted_output_bf': round(predicted_output_bf, 2),
+        'total_orders': len(order_list),
+        'kd_materials_count': len(output_agg),
+        'kd_distribution': output_agg.to_dict('records'),
+        'prediction_method': prediction_method
+    }

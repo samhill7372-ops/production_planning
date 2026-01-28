@@ -54,7 +54,9 @@ from src.prediction_utils import (
     get_top_recommendation,
     calculate_confidence_level,
     get_historical_kd_distribution,
-    calculate_kd_output_with_wastage
+    calculate_kd_output_with_wastage,
+    get_material_level_forward_prediction,
+    get_advanced_forward_prediction
 )
 
 # Page configuration
@@ -647,6 +649,339 @@ def render_reverse_prediction_section(model, encoders, feature_columns, options)
                     ]
                 }
                 st.table(pd.DataFrame(breakdown_data))
+
+
+def render_material_level_forward_prediction_section(options, df_261_raw, df_101_raw):
+    """Render the Material Level Forward Prediction (Yield Recommendation Engine).
+
+    This mode allows users to:
+    - Enter KS material, plant, and input BF quantity
+    - Get predicted total output BF based on historical yield
+    - Get distribution across KD materials (summing to 100%)
+    """
+    st.subheader("Material Level Forward Prediction")
+    st.caption("Enter KS material, plant, and quantity to predict KD output distribution")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**KS Material (Input)**")
+
+        # Plant selection
+        plant_options = options.get('Input_Plant', ['1M02', '1Y01'])
+        selected_plant = st.selectbox(
+            "Plant *",
+            options=plant_options,
+            key="mlfp_plant"
+        )
+
+        # Material selection with search
+        material_options = options.get('Input_Material', [])
+        mat_search = st.text_input(
+            "Search KS Material",
+            key="mlfp_mat_search",
+            placeholder="Type to filter..."
+        )
+
+        if mat_search:
+            filtered = [m for m in material_options if mat_search.upper() in str(m).upper()]
+        else:
+            filtered = material_options
+
+        selected_material = st.selectbox(
+            f"KS Material * ({len(filtered)} available)",
+            options=filtered if filtered else ['No materials found'],
+            key="mlfp_material"
+        )
+
+    with col2:
+        st.markdown("**Input Quantity**")
+        input_bf = st.number_input(
+            "Input BF *",
+            min_value=0.0,
+            max_value=10000000.0,
+            value=10000.0,
+            step=1000.0,
+            key="mlfp_input_bf",
+            help="Board feet of KS material to process"
+        )
+
+        min_orders = st.number_input(
+            "Minimum Order Threshold",
+            min_value=1,
+            max_value=50,
+            value=5,
+            step=1,
+            key="mlfp_min_orders",
+            help="Only show KD materials with more than this many historical orders"
+        )
+
+    st.markdown("---")
+
+    if st.button("Predict KD Output", type="primary", key="mlfp_predict_btn", use_container_width=True):
+        if df_261_raw is None or df_101_raw is None:
+            st.error("No raw data available. Please ensure data files are loaded.")
+            return
+
+        if selected_material == 'No materials found':
+            st.error("Please select a valid KS material.")
+            return
+
+        with st.spinner("Calculating prediction..."):
+            result = get_material_level_forward_prediction(
+                ks_material=selected_material,
+                plant=selected_plant,
+                input_bf=input_bf,
+                df_261_raw=df_261_raw,
+                df_101_raw=df_101_raw,
+                min_order_count=min_orders
+            )
+            st.session_state.mlfp_result = result
+            st.session_state.mlfp_run = True
+
+    # Display Results
+    if st.session_state.get('mlfp_run'):
+        result = st.session_state.get('mlfp_result', {})
+
+        if 'error' in result:
+            st.warning(result['error'])
+            return
+
+        st.markdown("---")
+        st.header("Prediction Results")
+
+        # Summary metrics row 1 - Input/Output
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            st.metric("Input BF", f"{result['input_bf']:,.0f}")
+        with col_s2:
+            st.metric("Predicted Output BF", f"{result['predicted_output_bf']:,.0f}")
+        with col_s3:
+            st.metric("Yield %", f"{result['historical_yield_pct']:.1f}%")
+
+        # Summary metrics row 2 - Historical context
+        col_h1, col_h2, col_h3 = st.columns(3)
+        with col_h1:
+            st.metric("Historical Input BF", f"{result['total_hist_input_bf']:,.0f}")
+        with col_h2:
+            st.metric("Historical Output BF", f"{result['total_hist_output_bf']:,.0f}")
+        with col_h3:
+            st.metric("Historical Orders", f"{result['total_orders']:,}")
+
+        st.markdown("---")
+        st.subheader(f"KD Material Distribution ({result['kd_materials_count']} materials)")
+
+        distribution = result.get('kd_distribution', [])
+        if distribution:
+            df_dist = pd.DataFrame(distribution)
+
+            # Format display table
+            df_display = pd.DataFrame({
+                'KD Material': df_dist['KD_Material'],
+                'Contribution %': df_dist['Contribution_Pct'].apply(lambda x: f"{x:.1f}%"),
+                'Expected BF Output': df_dist['Expected_BF_Output'].apply(lambda x: f"{x:,.0f}"),
+                'Historical Orders': df_dist['Order_Count'],
+                'Historical BF': df_dist['Historical_BF_Output'].apply(lambda x: f"{x:,.0f}")
+            })
+
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+            # Totals row
+            total_pct = sum(d['Contribution_Pct'] for d in distribution)
+            total_bf = sum(d['Expected_BF_Output'] for d in distribution)
+            st.markdown(f"**Total: {total_pct:.1f}% | {total_bf:,.0f} BF**")
+
+            # Download button
+            export_df = pd.DataFrame(distribution)
+            export_df['KS_Material'] = result['ks_material']
+            export_df['Plant'] = result['plant']
+            export_df['Input_BF'] = result['input_bf']
+            export_df['Predicted_Total_Output_BF'] = result['predicted_output_bf']
+            export_df['Yield_Pct'] = result['historical_yield_pct']
+
+            csv = export_df.to_csv(index=False)
+            st.download_button(
+                label="Download KD Distribution (CSV)",
+                data=csv,
+                file_name=f"kd_prediction_{result['ks_material']}_{result['plant']}.csv",
+                mime="text/csv"
+            )
+
+
+def render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns):
+    """Render the Advanced Forward Prediction (ML + Statistical Hybrid).
+
+    Uses ML model for yield prediction + statistical distribution for KD materials.
+    """
+    st.subheader("Advanced Forward Prediction")
+    st.caption("ML model for yield prediction + statistical distribution for KD materials")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**KS Material (Input)**")
+
+        # Plant selection
+        plant_options = options.get('Input_Plant', ['1M02', '1Y01'])
+        selected_plant = st.selectbox(
+            "Plant *",
+            options=plant_options,
+            key="afp_plant"
+        )
+
+        # Material selection with search
+        material_options = options.get('Input_Material', [])
+        mat_search = st.text_input(
+            "Search KS Material",
+            key="afp_mat_search",
+            placeholder="Type to filter..."
+        )
+
+        if mat_search:
+            filtered = [m for m in material_options if mat_search.upper() in str(m).upper()]
+        else:
+            filtered = material_options
+
+        selected_material = st.selectbox(
+            f"KS Material * ({len(filtered)} available)",
+            options=filtered if filtered else ['No materials found'],
+            key="afp_material"
+        )
+
+    with col2:
+        st.markdown("**Input Quantity**")
+        input_bf = st.number_input(
+            "Input BF *",
+            min_value=0.0,
+            max_value=10000000.0,
+            value=10000.0,
+            step=1000.0,
+            key="afp_input_bf",
+            help="Board feet of KS material to process"
+        )
+
+        min_orders = st.number_input(
+            "Minimum Order Threshold",
+            min_value=1,
+            max_value=50,
+            value=5,
+            step=1,
+            key="afp_min_orders",
+            help="Only show KD materials with more than this many historical orders"
+        )
+
+    st.markdown("---")
+
+    if st.button("Predict with ML Model", type="primary", key="afp_predict_btn", use_container_width=True):
+        if df_261_raw is None or df_101_raw is None:
+            st.error("No raw data available. Please ensure data files are loaded.")
+            return
+
+        if selected_material == 'No materials found':
+            st.error("Please select a valid KS material.")
+            return
+
+        if model is None:
+            st.error("ML model not available. Please ensure the model is trained.")
+            return
+
+        with st.spinner("Running ML prediction..."):
+            result = get_advanced_forward_prediction(
+                ks_material=selected_material,
+                plant=selected_plant,
+                input_bf=input_bf,
+                df_261_raw=df_261_raw,
+                df_101_raw=df_101_raw,
+                model=model,
+                encoders=encoders,
+                feature_columns=feature_columns,
+                min_order_count=min_orders
+            )
+            st.session_state.afp_result = result
+            st.session_state.afp_run = True
+
+    # Display Results
+    if st.session_state.get('afp_run'):
+        result = st.session_state.get('afp_result', {})
+
+        if 'error' in result:
+            st.warning(result['error'])
+            return
+
+        st.markdown("---")
+        st.header("Prediction Results")
+
+        # Show prediction method
+        st.info(f"**Prediction Method:** {result.get('prediction_method', 'ML + Statistical')}")
+
+        # Summary metrics row 1 - Yield comparison
+        col_y1, col_y2, col_y3 = st.columns(3)
+        with col_y1:
+            st.metric("ML Predicted Yield", f"{result['ml_yield_pct']:.1f}%")
+        with col_y2:
+            st.metric("Historical Yield", f"{result['historical_yield_pct']:.1f}%")
+        with col_y3:
+            diff = result['ml_yield_pct'] - result['historical_yield_pct']
+            st.metric("Difference", f"{diff:+.1f}%")
+
+        # Summary metrics row 2 - Input/Output
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            st.metric("Input BF", f"{result['input_bf']:,.0f}")
+        with col_s2:
+            st.metric("Predicted Output BF", f"{result['predicted_output_bf']:,.0f}")
+        with col_s3:
+            st.metric("ML Confidence", result.get('ml_confidence', 'N/A'))
+
+        # Summary metrics row 3 - Historical context
+        col_h1, col_h2, col_h3 = st.columns(3)
+        with col_h1:
+            st.metric("Historical Input BF", f"{result['total_hist_input_bf']:,.0f}")
+        with col_h2:
+            st.metric("Historical Output BF", f"{result['total_hist_output_bf']:,.0f}")
+        with col_h3:
+            st.metric("Historical Orders", f"{result['total_orders']:,}")
+
+        st.markdown("---")
+        st.subheader(f"KD Material Distribution ({result['kd_materials_count']} materials)")
+
+        distribution = result.get('kd_distribution', [])
+        if distribution:
+            df_dist = pd.DataFrame(distribution)
+
+            # Format display table
+            df_display = pd.DataFrame({
+                'KD Material': df_dist['KD_Material'],
+                'Contribution %': df_dist['Contribution_Pct'].apply(lambda x: f"{x:.1f}%"),
+                'Expected BF Output': df_dist['Expected_BF_Output'].apply(lambda x: f"{x:,.0f}"),
+                'Historical Orders': df_dist['Order_Count'],
+                'Historical BF': df_dist['Historical_BF_Output'].apply(lambda x: f"{x:,.0f}")
+            })
+
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+            # Totals row
+            total_pct = sum(d['Contribution_Pct'] for d in distribution)
+            total_bf = sum(d['Expected_BF_Output'] for d in distribution)
+            st.markdown(f"**Total: {total_pct:.1f}% | {total_bf:,.0f} BF**")
+
+            # Download button
+            export_df = pd.DataFrame(distribution)
+            export_df['KS_Material'] = result['ks_material']
+            export_df['Plant'] = result['plant']
+            export_df['Input_BF'] = result['input_bf']
+            export_df['ML_Yield_Pct'] = result['ml_yield_pct']
+            export_df['Historical_Yield_Pct'] = result['historical_yield_pct']
+            export_df['Predicted_Total_Output_BF'] = result['predicted_output_bf']
+            export_df['Prediction_Method'] = result.get('prediction_method', 'ML + Statistical')
+
+            csv = export_df.to_csv(index=False)
+            st.download_button(
+                label="Download KD Distribution (CSV)",
+                data=csv,
+                file_name=f"ml_prediction_{result['ks_material']}_{result['plant']}.csv",
+                mime="text/csv"
+            )
 
 
 def render_kd_material_lookup_section(options, historical_data, df_261_raw=None, df_101_raw=None):
@@ -1858,11 +2193,13 @@ def main():
         "Choose prediction type:",
         [
             "KD Material Lookup (Find KD Outputs)",
+            "Material Level Forward Prediction",
+            "Advanced Forward Prediction",
             "Forward Prediction (Input -> Output)",
             "Reverse Prediction (Output -> Input)"
         ],
         horizontal=True,
-        help="KD Lookup: Find which KD materials a KS input has historically produced. Forward: Calculate expected output from input materials. Reverse: Calculate required input for desired output."
+        help="KD Lookup: Find historical KD outputs. Material Level: Statistical prediction from historical data. Advanced: ML model for yield + statistical distribution. Forward: Full ML prediction. Reverse: Calculate required input."
     )
 
     st.markdown("---")
@@ -1871,6 +2208,16 @@ def main():
         # KD Material Lookup Section
         render_kd_material_lookup_section(options, historical_data, df_261_raw, df_101_raw)
         return  # Exit early for KD lookup mode
+
+    if prediction_mode == "Material Level Forward Prediction":
+        # Material Level Forward Prediction Section (Yield Recommendation Engine)
+        render_material_level_forward_prediction_section(options, df_261_raw, df_101_raw)
+        return  # Exit early for this mode
+
+    if prediction_mode == "Advanced Forward Prediction":
+        # Advanced Forward Prediction Section (ML + Statistical Hybrid)
+        render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns)
+        return  # Exit early for this mode
 
     if prediction_mode == "Reverse Prediction (Output -> Input)":
         # Reverse Prediction Section
