@@ -1072,6 +1072,216 @@ def get_historical_kd_distribution(
     return results
 
 
+def get_ks_grade_contributions_for_kd(
+    kd_material: str,
+    ks_material: str,
+    plant: str,
+    kd_contrib_pct: float,
+    df_261_raw: pd.DataFrame,
+    df_101_raw: pd.DataFrame
+) -> List[Dict[str, Any]]:
+    """
+    Get KS input material contributions BY GRADE for a specific KD output material.
+
+    For a given KD output material, finds which KS input materials and grades
+    contributed to it, with dimensional details.
+
+    Args:
+        kd_material: The KD output material code (e.g., "4POPRKD")
+        ks_material: The selected KS input material (to filter relevant orders)
+        plant: The plant code (e.g., "1Y01")
+        kd_contrib_pct: The parent KD material's contribution % (e.g., 63.7)
+        df_261_raw: Raw 261 CSV data (input/KS records)
+        df_101_raw: Raw 101 CSV data (output/KD records)
+
+    Returns:
+        List of dicts with KS + grade contribution details.
+        Contribution percentages sum to kd_contrib_pct (not 100%).
+        [
+            {
+                'KS_Material': '4PO3BKS',
+                'Grade': 'PR',
+                'Order_Count': 5,
+                'BF_Output': 3200.0,
+                'Contribution_Pct': 33.4,  # Sums to parent's 63.7%
+                'Avg_Length': 96.0,
+                'Avg_Width': 8.0,
+                'Avg_Thickness': 4.0
+            },
+            ...
+        ]
+    """
+    if df_261_raw is None or df_101_raw is None:
+        return []
+
+    if len(df_261_raw) == 0 or len(df_101_raw) == 0:
+        return []
+
+    # Step 1: Find manufacturing orders for this KS material + plant (input side)
+    filtered_261 = df_261_raw.copy()
+    if 'MATERIAL' in filtered_261.columns:
+        filtered_261 = filtered_261[filtered_261['MATERIAL'] == ks_material]
+    if 'PLANT' in filtered_261.columns:
+        filtered_261 = filtered_261[filtered_261['PLANT'] == plant]
+
+    if len(filtered_261) == 0:
+        return []
+
+    # Get the manufacturing orders from KS input
+    ks_orders = set(filtered_261['MANUFACTURINGORDER'].unique())
+
+    # Step 2: Find output records for these orders that produced the specific KD material
+    filtered_101 = df_101_raw[
+        (df_101_raw['MANUFACTURINGORDER'].isin(ks_orders)) &
+        (df_101_raw['MATERIAL'] == kd_material)
+    ].copy()
+
+    if len(filtered_101) == 0:
+        return []
+
+    # Get orders that actually produced this KD material
+    kd_orders = set(filtered_101['MANUFACTURINGORDER'].unique())
+
+    # Step 3: Get the KS input details for these specific orders
+    input_for_kd = df_261_raw[
+        (df_261_raw['MANUFACTURINGORDER'].isin(kd_orders)) &
+        (df_261_raw['MATERIAL'] == ks_material)
+    ].copy()
+
+    if len(input_for_kd) == 0:
+        return []
+
+    # Normalize grade column (handle case variations)
+    if 'TALLYGRADE' in input_for_kd.columns:
+        input_for_kd['TALLYGRADE'] = input_for_kd['TALLYGRADE'].astype(str).str.upper().str.strip()
+
+    # Step 4: Aggregate by KS material + GRADE
+    group_cols = ['MATERIAL']
+    if 'TALLYGRADE' in input_for_kd.columns:
+        group_cols.append('TALLYGRADE')
+
+    agg_dict = {
+        'MANUFACTURINGORDER': 'nunique',
+        'BFIN': 'sum'
+    }
+
+    # Add dimension columns if available
+    dim_cols = ['TALLYLENGTH', 'TALLYWIDTH', 'MATERIALTHICKNESS']
+    for col in dim_cols:
+        if col in input_for_kd.columns:
+            agg_dict[col] = 'mean'
+
+    ks_stats = input_for_kd.groupby(group_cols).agg(agg_dict).reset_index()
+
+    # Rename columns
+    col_names = ['KS_Material']
+    if 'TALLYGRADE' in input_for_kd.columns:
+        col_names.append('Grade')
+    col_names.extend(['Order_Count', 'BF_In'])
+    for col in dim_cols:
+        if col in input_for_kd.columns:
+            col_names.append(f'Avg_{col.replace("TALLY", "").replace("MATERIAL", "").title()}')
+    ks_stats.columns = col_names
+
+    # Step 5: Get the BF output per order for this KD material
+    order_output = filtered_101.groupby('MANUFACTURINGORDER')['BFOUT'].sum().reset_index()
+    order_output.columns = ['MANUFACTURINGORDER', 'Order_BF_Out']
+
+    # Join input records with output BF
+    input_with_output = input_for_kd.merge(order_output, on='MANUFACTURINGORDER', how='left')
+
+    # Aggregate output BF by KS material + grade
+    if 'TALLYGRADE' in input_for_kd.columns:
+        output_by_grade = input_with_output.groupby(['MATERIAL', 'TALLYGRADE'])['Order_BF_Out'].sum().reset_index()
+        output_by_grade.columns = ['KS_Material', 'Grade', 'BF_Output']
+        ks_stats = ks_stats.merge(output_by_grade, on=['KS_Material', 'Grade'], how='left')
+    else:
+        output_by_ks = input_with_output.groupby('MATERIAL')['Order_BF_Out'].sum().reset_index()
+        output_by_ks.columns = ['KS_Material', 'BF_Output']
+        ks_stats = ks_stats.merge(output_by_ks, on='KS_Material', how='left')
+
+    ks_stats['BF_Output'] = ks_stats['BF_Output'].fillna(0)
+
+    # Step 6: Calculate contribution percentage (must sum to kd_contrib_pct, not 100%)
+    total_bf_output = ks_stats['BF_Output'].sum()
+    if total_bf_output > 0:
+        # Scale so that grades sum to the parent KD's contribution percentage
+        ks_stats['Contribution_Pct'] = (ks_stats['BF_Output'] / total_bf_output * kd_contrib_pct).round(1)
+    else:
+        ks_stats['Contribution_Pct'] = 0
+
+    # Sort by BF output descending
+    ks_stats = ks_stats.sort_values('BF_Output', ascending=False).reset_index(drop=True)
+
+    # Convert to list of dicts
+    results = ks_stats.to_dict('records')
+
+    return results
+
+
+def get_ks_grade_contributions_for_kd_from_precomputed(
+    kd_material: str,
+    ks_material: str,
+    plant: str,
+    kd_contrib_pct: float,
+    precomputed_data: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Get KS input material contributions BY GRADE using PRE-COMPUTED data.
+
+    This is the deployment-friendly version that uses pre-computed grade
+    breakdown data instead of raw CSV files.
+
+    Args:
+        kd_material: The KD output material code (e.g., "4POPRKD")
+        ks_material: The selected KS input material
+        plant: The plant code (e.g., "1Y01")
+        kd_contrib_pct: The parent KD material's contribution % (e.g., 63.7)
+        precomputed_data: Pre-computed data dict containing 'grade_breakdown_data'
+
+    Returns:
+        List of dicts with KS + grade contribution details.
+        Same format as get_ks_grade_contributions_for_kd().
+    """
+    if precomputed_data is None:
+        return []
+
+    grade_data = precomputed_data.get('grade_breakdown_data', {})
+    if not grade_data:
+        return []
+
+    # Navigate to the specific KS -> Plant -> KD entry
+    ks_data = grade_data.get(ks_material, {})
+    plant_data = ks_data.get(plant, {})
+    grades = plant_data.get(kd_material, [])
+
+    if not grades:
+        return []
+
+    # Scale percentages to sum to kd_contrib_pct (not 100%)
+    total_pct = sum(g.get('Pct_Of_KD', 0) for g in grades)
+
+    results = []
+    for g in grades:
+        if total_pct > 0:
+            scaled_pct = g.get('Pct_Of_KD', 0) / total_pct * kd_contrib_pct
+        else:
+            scaled_pct = 0
+
+        results.append({
+            'KS_Material': ks_material,
+            'Grade': g.get('Grade', 'N/A'),
+            'Order_Count': g.get('Order_Count', 0),
+            'BF_Output': g.get('BF_Output', 0),
+            'Contribution_Pct': round(scaled_pct, 1),
+            'Avg_Length': g.get('Avg_Length'),
+            'Avg_Width': g.get('Avg_Width'),
+            'Avg_Thickness': g.get('Avg_Thickness')
+        })
+
+    return results
+
+
 def calculate_kd_output_with_wastage(
     input_bf: float,
     kd_distribution: List[Dict[str, Any]],
@@ -1250,6 +1460,222 @@ def get_material_level_forward_prediction(
         'kd_materials_count': len(output_agg),
         'kd_distribution': output_agg.to_dict('records')
     }
+
+
+def get_material_level_forward_prediction_from_precomputed(
+    ks_material: str,
+    plant: str,
+    input_bf: float,
+    material_stats: Dict[str, Any],
+    min_order_count: int = 5
+) -> Dict[str, Any]:
+    """
+    Material-level forward prediction using PRE-COMPUTED statistics.
+
+    This is the deployment-friendly version that uses pre-computed material_stats
+    instead of raw CSV files.
+
+    Args:
+        ks_material: Input KS material code
+        plant: Production plant
+        input_bf: User-entered BF IN quantity
+        material_stats: Pre-computed material statistics dict
+        min_order_count: Minimum orders for KD material inclusion (already applied in pre-computation)
+
+    Returns:
+        Dict with prediction results and KD material distribution
+    """
+    # Look up pre-computed stats
+    if ks_material not in material_stats:
+        return {
+            'error': f'No pre-computed data found for KS Material: {ks_material}',
+            'ks_material': ks_material,
+            'plant': plant
+        }
+
+    if plant not in material_stats[ks_material]:
+        # Try to find any plant for this material
+        available_plants = list(material_stats[ks_material].keys())
+        return {
+            'error': f'No data for Plant: {plant}. Available plants: {", ".join(available_plants[:5])}',
+            'ks_material': ks_material,
+            'plant': plant
+        }
+
+    stats = material_stats[ks_material][plant]
+
+    # Calculate predicted output using historical yield
+    historical_yield_pct = stats['historical_yield_pct']
+    predicted_output_bf = input_bf * (historical_yield_pct / 100)
+
+    # Calculate expected output per KD material
+    kd_distribution = []
+    for kd in stats['kd_distribution']:
+        expected_bf = predicted_output_bf * (kd['Contribution_Pct'] / 100)
+        kd_distribution.append({
+            'KD_Material': kd['KD_Material'],
+            'Historical_BF_Output': kd['Historical_BF_Output'],
+            'Order_Count': kd['Order_Count'],
+            'Contribution_Pct': kd['Contribution_Pct'],
+            'Expected_BF_Output': round(expected_bf, 2)
+        })
+
+    return {
+        'ks_material': ks_material,
+        'plant': plant,
+        'input_bf': input_bf,
+        'total_hist_input_bf': stats['total_hist_input_bf'],
+        'total_hist_output_bf': stats['total_hist_output_bf'],
+        'historical_yield_pct': historical_yield_pct,
+        'predicted_output_bf': round(predicted_output_bf, 2),
+        'total_orders': stats['total_orders'],
+        'kd_materials_count': len(kd_distribution),
+        'kd_distribution': kd_distribution
+    }
+
+
+def get_advanced_forward_prediction_from_precomputed(
+    ks_material: str,
+    plant: str,
+    input_bf: float,
+    material_stats: Dict[str, Any],
+    model,
+    encoders: Dict,
+    feature_columns: List[str],
+    min_order_count: int = 5
+) -> Dict[str, Any]:
+    """
+    Advanced forward prediction using ML model + PRE-COMPUTED statistics.
+
+    This is the deployment-friendly version that uses pre-computed material_stats
+    for historical data and the ML model for yield prediction.
+
+    Args:
+        ks_material: Input KS material code
+        plant: Production plant
+        input_bf: User-entered BF IN quantity
+        material_stats: Pre-computed material statistics dict
+        model: Trained YieldPredictionModel
+        encoders: LabelEncoders for categorical features
+        feature_columns: Feature columns used by model
+        min_order_count: Minimum orders for KD material inclusion
+
+    Returns:
+        Dict with ML-based prediction and KD distribution
+    """
+    # Look up pre-computed stats
+    if ks_material not in material_stats:
+        return {
+            'error': f'No pre-computed data found for KS Material: {ks_material}',
+            'ks_material': ks_material,
+            'plant': plant
+        }
+
+    if plant not in material_stats[ks_material]:
+        available_plants = list(material_stats[ks_material].keys())
+        return {
+            'error': f'No data for Plant: {plant}. Available plants: {", ".join(available_plants[:5])}',
+            'ks_material': ks_material,
+            'plant': plant
+        }
+
+    stats = material_stats[ks_material][plant]
+
+    # Get historical yield for reference
+    historical_yield_pct = stats['historical_yield_pct']
+
+    # Use ML model for yield prediction
+    input_data = {
+        'Input_Plant': plant,
+        'Input_Material': ks_material,
+        'Input_Thickness': stats['avg_thickness'],
+        'Input_Specie': stats['most_common_specie'],
+        'Input_Grade': stats['most_common_grade'],
+        'Input_Length': stats['avg_length'],
+        'Input_Width': stats['avg_width'],
+        'Total_Input_BF': input_bf
+    }
+
+    ml_yield_pct = historical_yield_pct  # Default fallback
+    ml_confidence = 'LOW'
+    prediction_method = 'Statistical (ML fallback)'
+
+    try:
+        if model is not None:
+            ml_prediction = forward_predict(model, input_data, encoders, feature_columns)
+            ml_yield_pct = ml_prediction['predicted_yield_pct']
+            ml_confidence = ml_prediction.get('confidence', 'MEDIUM')
+            prediction_method = 'ML Model + Statistical Distribution'
+    except Exception as e:
+        ml_yield_pct = historical_yield_pct
+        ml_confidence = 'LOW (ML unavailable)'
+        prediction_method = 'Statistical (ML error)'
+
+    # Calculate predicted output using ML yield
+    predicted_output_bf = input_bf * (ml_yield_pct / 100)
+
+    # Calculate expected output per KD material
+    kd_distribution = []
+    for kd in stats['kd_distribution']:
+        expected_bf = predicted_output_bf * (kd['Contribution_Pct'] / 100)
+        kd_distribution.append({
+            'KD_Material': kd['KD_Material'],
+            'Historical_BF_Output': kd['Historical_BF_Output'],
+            'Order_Count': kd['Order_Count'],
+            'Contribution_Pct': kd['Contribution_Pct'],
+            'Expected_BF_Output': round(expected_bf, 2)
+        })
+
+    return {
+        'ks_material': ks_material,
+        'plant': plant,
+        'input_bf': input_bf,
+        'total_hist_input_bf': stats['total_hist_input_bf'],
+        'total_hist_output_bf': stats['total_hist_output_bf'],
+        'historical_yield_pct': historical_yield_pct,
+        'ml_yield_pct': round(ml_yield_pct, 2),
+        'ml_confidence': ml_confidence,
+        'predicted_output_bf': round(predicted_output_bf, 2),
+        'total_orders': stats['total_orders'],
+        'kd_materials_count': len(kd_distribution),
+        'kd_distribution': kd_distribution,
+        'prediction_method': prediction_method
+    }
+
+
+def get_historical_kd_distribution_from_precomputed(
+    input_material: str,
+    kd_lookup: Dict[str, Any],
+    input_thickness: float = None,
+    input_grade: str = None,
+    input_species: str = None,
+    input_plant: str = None
+) -> List[Dict[str, Any]]:
+    """
+    Get KD distribution from PRE-COMPUTED lookup data.
+
+    This is the deployment-friendly version that uses pre-computed kd_lookup
+    instead of raw DataFrame queries.
+
+    Note: input_thickness, input_grade, input_species, input_plant filters
+    are not supported in pre-computed mode (would require too much storage).
+    The lookup returns all historical outputs for the input material.
+
+    Args:
+        input_material: Input material code
+        kd_lookup: Pre-computed KD lookup dictionary
+        input_thickness: (ignored in pre-computed mode)
+        input_grade: (ignored in pre-computed mode)
+        input_species: (ignored in pre-computed mode)
+        input_plant: (ignored in pre-computed mode)
+
+    Returns:
+        List of dicts with Output_Material, Output_Grade, BF_Output, etc.
+    """
+    if input_material not in kd_lookup:
+        return []
+
+    return kd_lookup[input_material].get('kd_outputs', [])
 
 
 def get_advanced_forward_prediction(

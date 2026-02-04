@@ -38,7 +38,8 @@ from src.data_preparation import (
     load_raw_csv_data,
     get_unique_materials_from_csv,
     get_historical_yield_by_material,
-    get_available_years
+    get_available_years,
+    load_precomputed_historical_data
 )
 from src.model_training import YieldPredictionModel, train_yield_model, OutputMaterialClassifier, train_output_classifier
 from src.prediction_utils import (
@@ -56,7 +57,12 @@ from src.prediction_utils import (
     get_historical_kd_distribution,
     calculate_kd_output_with_wastage,
     get_material_level_forward_prediction,
-    get_advanced_forward_prediction
+    get_advanced_forward_prediction,
+    get_material_level_forward_prediction_from_precomputed,
+    get_advanced_forward_prediction_from_precomputed,
+    get_historical_kd_distribution_from_precomputed,
+    get_ks_grade_contributions_for_kd,
+    get_ks_grade_contributions_for_kd_from_precomputed
 )
 
 # Page configuration
@@ -202,10 +208,11 @@ def load_historical_data(selected_year: str = None):
                       If None, loads all available years.
 
     Returns:
-        Tuple of (historical_data, df_261_raw, df_101_raw)
+        Tuple of (historical_data, df_261_raw, df_101_raw, precomputed_data)
         - historical_data: Joined and encoded data (for distribution calculation)
-        - df_261_raw: RAW 261 CSV data (for accurate BFIN totals)
-        - df_101_raw: RAW 101 CSV data (for accurate BFOUT totals)
+        - df_261_raw: RAW 261 CSV data (for accurate BFIN totals) or None
+        - df_101_raw: RAW 101 CSV data (for accurate BFOUT totals) or None
+        - precomputed_data: Pre-computed statistics dict (for deployment) or None
     """
     # Determine which years to load
     if selected_year:
@@ -220,12 +227,19 @@ def load_historical_data(selected_year: str = None):
     except Exception as e:
         print(f"Could not load raw CSV data: {e}")
 
+    # Load pre-computed data (for deployment without CSV files)
+    precomputed_data = None
+    try:
+        precomputed_data = load_precomputed_historical_data(year=selected_year)
+    except Exception as e:
+        print(f"Could not load pre-computed data: {e}")
+
     # Option 1: Load from year-specific CSV files
     try:
         df, encoders = prepare_full_dataset(years=years_to_load)
         print(f"Loaded historical data for {years_to_load}: {len(df)} records")
         print(f"Columns: {df.columns.tolist()}")
-        return df, df_261_raw, df_101_raw
+        return df, df_261_raw, df_101_raw, precomputed_data
     except Exception as e:
         print(f"Could not load year-specific data: {e}")
 
@@ -235,11 +249,24 @@ def load_historical_data(selected_year: str = None):
         csv_261 = os.path.join(DATA_DIR, "261.csv")
         if os.path.exists(csv_101) and os.path.exists(csv_261):
             df, encoders = prepare_full_dataset(csv_261, csv_101)
-            return df, df_261_raw, df_101_raw
+            return df, df_261_raw, df_101_raw, precomputed_data
     except Exception as e:
         print(f"Could not load from generic CSV: {e}")
 
-    # Option 3: Load pre-computed historical summary from models/ folder (no raw data)
+    # Option 3: Load from pre-computed data (deployment mode)
+    if precomputed_data is not None:
+        summary_df = precomputed_data.get('summary_df')
+        if summary_df is not None and len(summary_df) > 0:
+            # Rename columns to match expected format
+            if 'Mean_Yield' in summary_df.columns:
+                summary_df = summary_df.rename(columns={
+                    'Mean_Yield': 'Yield_Percentage',
+                    'Order_Count': 'Historical_Orders'
+                })
+            print(f"Using pre-computed summary_df: {len(summary_df)} records")
+            return summary_df, df_261_raw, df_101_raw, precomputed_data
+
+    # Option 4: Load pre-computed historical summary from models/ folder
     try:
         hist_path = os.path.join(MODELS_DIR, "historical_summary.joblib")
         if os.path.exists(hist_path):
@@ -249,11 +276,11 @@ def load_historical_data(selected_year: str = None):
                 'Order_Count': 'Historical_Orders'
             })
             print(f"Loaded historical_summary.joblib: {len(historical_summary)} records")
-            return historical_summary, df_261_raw, df_101_raw
+            return historical_summary, df_261_raw, df_101_raw, precomputed_data
     except Exception as e:
         print(f"Could not load historical_summary: {e}")
 
-    return None, df_261_raw, df_101_raw
+    return None, df_261_raw, df_101_raw, precomputed_data
 
 
 @st.cache_data
@@ -651,13 +678,218 @@ def render_reverse_prediction_section(model, encoders, feature_columns, options)
                 st.table(pd.DataFrame(breakdown_data))
 
 
-def render_material_level_forward_prediction_section(options, df_261_raw, df_101_raw):
+def render_sample_data_test_section(model, encoders, feature_columns):
+    """Test model predictions using sample data files (sample_261.csv and sample_101.csv).
+
+    This section allows testing the model against controlled sample data to:
+    - Verify yield predictions accuracy
+    - Compare actual vs predicted output materials
+    - Identify prediction errors and issues
+    """
+    st.subheader("Sample Data Test")
+    st.caption("Test model predictions against sample_261.csv and sample_101.csv")
+
+    # Load sample data files
+    sample_261_path = os.path.join(DATA_DIR, "sample_261.csv")
+    sample_101_path = os.path.join(DATA_DIR, "sample_101.csv")
+
+    # Check if files exist
+    if not os.path.exists(sample_261_path):
+        st.error(f"sample_261.csv not found at {sample_261_path}")
+        st.info("Create sample data files first using scripts/test_sample_data.py or manually.")
+        return
+
+    if not os.path.exists(sample_101_path):
+        st.error(f"sample_101.csv not found at {sample_101_path}")
+        return
+
+    # Load sample data
+    df_261 = pd.read_csv(sample_261_path)
+    df_101 = pd.read_csv(sample_101_path)
+
+    # Data Summary
+    st.markdown("### Sample Data Summary")
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric("Orders", df_261['MANUFACTURINGORDER'].nunique())
+    with col2:
+        st.metric("Input Materials", df_261['MATERIAL'].nunique())
+    with col3:
+        st.metric("Total Input BF", f"{df_261['BFIN'].sum():,.0f}")
+    with col4:
+        st.metric("Total Output BF", f"{df_101['BFOUT'].sum():,.0f}")
+
+    # Calculate actual yields
+    input_by_order = df_261.groupby('MANUFACTURINGORDER')['BFIN'].sum()
+    output_by_order = df_101.groupby('MANUFACTURINGORDER')['BFOUT'].sum()
+
+    actual_yields = pd.DataFrame({
+        'Input_BF': input_by_order,
+        'Output_BF': output_by_order
+    }).fillna(0)
+    actual_yields['Actual_Yield_Pct'] = (actual_yields['Output_BF'] / actual_yields['Input_BF'] * 100).round(2)
+
+    overall_actual_yield = actual_yields['Output_BF'].sum() / actual_yields['Input_BF'].sum() * 100
+
+    st.markdown("---")
+
+    # Run predictions button
+    if st.button("Run Predictions", type="primary", use_container_width=True):
+        results = []
+        orders = df_261['MANUFACTURINGORDER'].unique()
+
+        progress_bar = st.progress(0)
+
+        for i, order in enumerate(orders):
+            order_261 = df_261[df_261['MANUFACTURINGORDER'] == order]
+            order_101 = df_101[df_101['MANUFACTURINGORDER'] == order]
+
+            # Aggregate input
+            total_input_bf = order_261['BFIN'].sum()
+            total_output_bf = order_101['BFOUT'].sum()
+            actual_yield = (total_output_bf / total_input_bf * 100) if total_input_bf > 0 else 0
+
+            # Get dominant input characteristics
+            input_material = order_261['MATERIAL'].mode().iloc[0] if len(order_261) > 0 else 'Unknown'
+            input_specie = order_261['MATERIALSPECIE'].mode().iloc[0] if len(order_261) > 0 else 'Unknown'
+            input_plant = order_261['PLANT'].mode().iloc[0] if len(order_261) > 0 else 'Unknown'
+            input_thickness = order_261['MATERIALTHICKNESS'].mean() if len(order_261) > 0 else 0
+            input_grade = order_261['TALLYGRADE'].mode().iloc[0] if len(order_261) > 0 else 'Unknown'
+            input_length = order_261['TALLYLENGTH'].mean() if len(order_261) > 0 else 0
+            input_width = order_261['TALLYWIDTH'].mean() if len(order_261) > 0 else 0
+
+            # Build input dict for prediction
+            input_data = {
+                'Input_Plant': str(input_plant),
+                'Input_Material': str(input_material),
+                'Input_Thickness': float(input_thickness),
+                'Input_Specie': str(input_specie),
+                'Input_Grade': str(input_grade),
+                'Input_Length': float(input_length),
+                'Input_Width': float(input_width),
+                'Total_Input_BF': float(total_input_bf)
+            }
+
+            # Make yield prediction
+            try:
+                pred_result = forward_predict(model, input_data, encoders, feature_columns)
+                predicted_yield = pred_result['predicted_yield_pct']
+                predicted_output_bf = pred_result['predicted_output_bf']
+            except Exception as e:
+                predicted_yield = 0
+                predicted_output_bf = 0
+
+            # Actual output materials
+            actual_materials = order_101['MATERIAL'].unique().tolist() if len(order_101) > 0 else []
+
+            yield_error = predicted_yield - actual_yield
+
+            results.append({
+                'Order': order,
+                'Input Material': input_material,
+                'Species': input_specie,
+                'Plant': input_plant,
+                'Input BF': total_input_bf,
+                'Actual Output BF': total_output_bf,
+                'Predicted Output BF': round(predicted_output_bf, 0),
+                'Actual Yield %': round(actual_yield, 2),
+                'Predicted Yield %': round(predicted_yield, 2),
+                'Yield Error %': round(yield_error, 2),
+                'Output Materials': len(actual_materials)
+            })
+
+            progress_bar.progress((i + 1) / len(orders))
+
+        progress_bar.empty()
+
+        # Display results
+        st.markdown("### Prediction Results")
+
+        df_results = pd.DataFrame(results)
+
+        # Summary metrics
+        mae = df_results['Yield Error %'].abs().mean()
+        rmse = np.sqrt((df_results['Yield Error %'] ** 2).mean())
+        avg_predicted = df_results['Predicted Yield %'].mean()
+        avg_actual = df_results['Actual Yield %'].mean()
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Mean Abs Error", f"{mae:.2f}%")
+        with col2:
+            st.metric("RMSE", f"{rmse:.2f}%")
+        with col3:
+            st.metric("Avg Predicted Yield", f"{avg_predicted:.2f}%")
+        with col4:
+            st.metric("Avg Actual Yield", f"{avg_actual:.2f}%")
+
+        st.markdown("---")
+
+        # Results table with color coding
+        st.markdown("### Detailed Results by Order")
+
+        # Style the dataframe
+        def color_error(val):
+            if abs(val) < 3:
+                return 'background-color: #d4edda'  # Green
+            elif abs(val) < 5:
+                return 'background-color: #fff3cd'  # Yellow
+            else:
+                return 'background-color: #f8d7da'  # Red
+
+        styled_df = df_results.style.applymap(color_error, subset=['Yield Error %'])
+        st.dataframe(styled_df, use_container_width=True)
+
+        # Per-order details in expandable sections
+        st.markdown("### Order Details")
+
+        for r in results:
+            order_261 = df_261[df_261['MANUFACTURINGORDER'] == r['Order']]
+            order_101 = df_101[df_101['MANUFACTURINGORDER'] == r['Order']]
+
+            error_color = "🟢" if abs(r['Yield Error %']) < 3 else ("🟡" if abs(r['Yield Error %']) < 5 else "🔴")
+
+            with st.expander(f"{error_color} {r['Order']} - {r['Input Material']} ({r['Species']}) - Error: {r['Yield Error %']:+.2f}%"):
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("**Input (261)**")
+                    st.write(f"- Material: {r['Input Material']}")
+                    st.write(f"- Species: {r['Species']}")
+                    st.write(f"- Plant: {r['Plant']}")
+                    st.write(f"- Input BF: {r['Input BF']:,.0f}")
+                    st.write(f"- Grades: {', '.join(order_261['TALLYGRADE'].unique())}")
+
+                with col2:
+                    st.markdown("**Output (101)**")
+                    st.write(f"- Actual Output BF: {r['Actual Output BF']:,.0f}")
+                    st.write(f"- Predicted Output BF: {r['Predicted Output BF']:,.0f}")
+                    st.write(f"- Actual Yield: {r['Actual Yield %']:.2f}%")
+                    st.write(f"- Predicted Yield: {r['Predicted Yield %']:.2f}%")
+                    st.write(f"- **Error: {r['Yield Error %']:+.2f}%**")
+
+                # Output materials
+                st.markdown("**Output Materials:**")
+                output_mat_summary = order_101.groupby('MATERIAL')['BFOUT'].sum().sort_values(ascending=False)
+                st.dataframe(output_mat_summary.reset_index().rename(columns={'MATERIAL': 'Output Material', 'BFOUT': 'BF Output'}), use_container_width=True)
+
+        # Save results option
+        if st.button("Save Results to CSV"):
+            output_path = os.path.join(DATA_DIR, "sample_test_results.csv")
+            df_results.to_csv(output_path, index=False)
+            st.success(f"Results saved to {output_path}")
+
+
+def render_material_level_forward_prediction_section(options, df_261_raw, df_101_raw, precomputed_data=None):
     """Render the Material Level Forward Prediction (Yield Recommendation Engine).
 
     This mode allows users to:
     - Enter KS material, plant, and input BF quantity
     - Get predicted total output BF based on historical yield
     - Get distribution across KD materials (summing to 100%)
+
+    Uses pre-computed data when raw CSV files are not available (deployment mode).
     """
     st.subheader("Material Level Forward Prediction")
     st.caption("Enter KS material, plant, and quantity to predict KD output distribution")
@@ -719,8 +951,12 @@ def render_material_level_forward_prediction_section(options, df_261_raw, df_101
     st.markdown("---")
 
     if st.button("Predict KD Output", type="primary", key="mlfp_predict_btn", use_container_width=True):
-        if df_261_raw is None or df_101_raw is None:
-            st.error("No raw data available. Please ensure data files are loaded.")
+        # Check if we have data available (either raw CSV or pre-computed)
+        has_raw_data = df_261_raw is not None and df_101_raw is not None
+        has_precomputed = precomputed_data is not None and 'material_stats' in precomputed_data
+
+        if not has_raw_data and not has_precomputed:
+            st.error("No data available. Please ensure data files are loaded or pre-computed data exists.")
             return
 
         if selected_material == 'No materials found':
@@ -728,14 +964,24 @@ def render_material_level_forward_prediction_section(options, df_261_raw, df_101
             return
 
         with st.spinner("Calculating prediction..."):
-            result = get_material_level_forward_prediction(
-                ks_material=selected_material,
-                plant=selected_plant,
-                input_bf=input_bf,
-                df_261_raw=df_261_raw,
-                df_101_raw=df_101_raw,
-                min_order_count=min_orders
-            )
+            # Use pre-computed data when raw CSV is not available
+            if has_raw_data:
+                result = get_material_level_forward_prediction(
+                    ks_material=selected_material,
+                    plant=selected_plant,
+                    input_bf=input_bf,
+                    df_261_raw=df_261_raw,
+                    df_101_raw=df_101_raw,
+                    min_order_count=min_orders
+                )
+            else:
+                result = get_material_level_forward_prediction_from_precomputed(
+                    ks_material=selected_material,
+                    plant=selected_plant,
+                    input_bf=input_bf,
+                    material_stats=precomputed_data['material_stats'],
+                    min_order_count=min_orders
+                )
             st.session_state.mlfp_result = result
             st.session_state.mlfp_run = True
 
@@ -808,10 +1054,11 @@ def render_material_level_forward_prediction_section(options, df_261_raw, df_101
             )
 
 
-def render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns):
+def render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns, precomputed_data=None):
     """Render the Advanced Forward Prediction (ML + Statistical Hybrid).
 
     Uses ML model for yield prediction + statistical distribution for KD materials.
+    Uses pre-computed data when raw CSV files are not available (deployment mode).
     """
     st.subheader("Advanced Forward Prediction")
     st.caption("ML model for yield prediction + statistical distribution for KD materials")
@@ -873,8 +1120,12 @@ def render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, 
     st.markdown("---")
 
     if st.button("Predict with ML Model", type="primary", key="afp_predict_btn", use_container_width=True):
-        if df_261_raw is None or df_101_raw is None:
-            st.error("No raw data available. Please ensure data files are loaded.")
+        # Check if we have data available (either raw CSV or pre-computed)
+        has_raw_data = df_261_raw is not None and df_101_raw is not None
+        has_precomputed = precomputed_data is not None and 'material_stats' in precomputed_data
+
+        if not has_raw_data and not has_precomputed:
+            st.error("No data available. Please ensure data files are loaded or pre-computed data exists.")
             return
 
         if selected_material == 'No materials found':
@@ -886,17 +1137,30 @@ def render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, 
             return
 
         with st.spinner("Running ML prediction..."):
-            result = get_advanced_forward_prediction(
-                ks_material=selected_material,
-                plant=selected_plant,
-                input_bf=input_bf,
-                df_261_raw=df_261_raw,
-                df_101_raw=df_101_raw,
-                model=model,
-                encoders=encoders,
-                feature_columns=feature_columns,
-                min_order_count=min_orders
-            )
+            # Use pre-computed data when raw CSV is not available
+            if has_raw_data:
+                result = get_advanced_forward_prediction(
+                    ks_material=selected_material,
+                    plant=selected_plant,
+                    input_bf=input_bf,
+                    df_261_raw=df_261_raw,
+                    df_101_raw=df_101_raw,
+                    model=model,
+                    encoders=encoders,
+                    feature_columns=feature_columns,
+                    min_order_count=min_orders
+                )
+            else:
+                result = get_advanced_forward_prediction_from_precomputed(
+                    ks_material=selected_material,
+                    plant=selected_plant,
+                    input_bf=input_bf,
+                    material_stats=precomputed_data['material_stats'],
+                    model=model,
+                    encoders=encoders,
+                    feature_columns=feature_columns,
+                    min_order_count=min_orders
+                )
             st.session_state.afp_result = result
             st.session_state.afp_run = True
 
@@ -944,26 +1208,198 @@ def render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, 
 
         st.markdown("---")
         st.subheader(f"KD Material Distribution ({result['kd_materials_count']} materials)")
+        st.caption("Click checkbox to expand grade breakdown (PR, 1C, 2C, etc.) with dimensions")
 
         distribution = result.get('kd_distribution', [])
         if distribution:
-            df_dist = pd.DataFrame(distribution)
+            # Check if we can show drill-down (need raw data or precomputed grade data)
+            has_raw_data = df_261_raw is not None and df_101_raw is not None
+            has_precomputed_grade = precomputed_data is not None and 'grade_breakdown_data' in precomputed_data
+            has_grade_data = has_raw_data or has_precomputed_grade
 
-            # Format display table
-            df_display = pd.DataFrame({
-                'KD Material': df_dist['KD_Material'],
-                'Contribution %': df_dist['Contribution_Pct'].apply(lambda x: f"{x:.1f}%"),
-                'Expected BF Output': df_dist['Expected_BF_Output'].apply(lambda x: f"{x:,.0f}"),
-                'Historical Orders': df_dist['Order_Count'],
-                'Historical BF': df_dist['Historical_BF_Output'].apply(lambda x: f"{x:,.0f}")
-            })
+            # Tree table header
+            header_cols = st.columns([0.03, 0.15, 0.10, 0.12, 0.10, 0.12, 0.12, 0.12, 0.14])
+            header_cols[0].markdown("")  # Expand toggle
+            header_cols[1].markdown("**KD Material**")
+            header_cols[2].markdown("**Contrib %**")
+            header_cols[3].markdown("**Expected BF**")
+            header_cols[4].markdown("**Orders**")
+            header_cols[5].markdown("**Hist BF**")
+            header_cols[6].markdown("**Avg Length**")
+            header_cols[7].markdown("**Avg Width**")
+            header_cols[8].markdown("**Thickness**")
 
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
+            st.markdown("<hr style='margin: 5px 0;'>", unsafe_allow_html=True)
+
+            # Display each KD material as a tree row
+            for i, kd_item in enumerate(distribution):
+                kd_mat = kd_item['KD_Material']
+                contrib_pct = kd_item['Contribution_Pct']
+                expected_bf = kd_item['Expected_BF_Output']
+                order_count = kd_item['Order_Count']
+                hist_bf = kd_item['Historical_BF_Output']
+
+                # Parent row with expand toggle
+                row_cols = st.columns([0.03, 0.15, 0.10, 0.12, 0.10, 0.12, 0.12, 0.12, 0.14])
+
+                with row_cols[0]:
+                    expanded = st.checkbox("", key=f"kd_expand_{i}", label_visibility="collapsed")
+
+                arrow = "▼" if expanded else "▶"
+                row_cols[1].markdown(f"{arrow} **{kd_mat}**")
+                row_cols[2].markdown(f"**{contrib_pct:.1f}%**")
+                row_cols[3].markdown(f"{expected_bf:,.0f}")
+                row_cols[4].markdown(f"{order_count}")
+                row_cols[5].markdown(f"{hist_bf:,.0f}")
+                row_cols[6].markdown("-")
+                row_cols[7].markdown("-")
+                row_cols[8].markdown("-")
+
+                # Child rows (grades) when expanded
+                if expanded and has_grade_data:
+                    # Use raw data if available, else fall back to precomputed
+                    if has_raw_data:
+                        grade_contributions = get_ks_grade_contributions_for_kd(
+                            kd_material=kd_mat,
+                            ks_material=result['ks_material'],
+                            plant=result['plant'],
+                            kd_contrib_pct=contrib_pct,
+                            df_261_raw=df_261_raw,
+                            df_101_raw=df_101_raw
+                        )
+                    else:
+                        grade_contributions = get_ks_grade_contributions_for_kd_from_precomputed(
+                            kd_material=kd_mat,
+                            ks_material=result['ks_material'],
+                            plant=result['plant'],
+                            kd_contrib_pct=contrib_pct,
+                            precomputed_data=precomputed_data
+                        )
+
+                    if grade_contributions:
+                        for grade in grade_contributions:
+                            grade_name = grade.get('Grade', 'N/A')
+                            grade_pct = grade.get('Contribution_Pct', 0)
+                            # Calculate expected BF for this grade based on parent's expected BF
+                            # Formula: grade_expected_bf = parent_expected_bf × (grade_pct / parent_contrib_pct)
+                            grade_expected_bf = expected_bf * (grade_pct / contrib_pct) if contrib_pct > 0 else 0
+                            grade_orders = grade.get('Order_Count', 0)
+                            avg_len = grade.get('Avg_Length', 0)
+                            avg_wid = grade.get('Avg_Width', 0)
+                            avg_thk = grade.get('Avg_Thickness', 0)
+
+                            child_cols = st.columns([0.03, 0.15, 0.10, 0.12, 0.10, 0.12, 0.12, 0.12, 0.14])
+                            child_cols[0].markdown("")
+                            child_cols[1].markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;└ {grade_name}")
+                            child_cols[2].markdown(f"{grade_pct:.1f}%")
+                            child_cols[3].markdown(f"{grade_expected_bf:,.0f}")
+                            child_cols[4].markdown(f"{grade_orders}")
+                            child_cols[5].markdown("-")
+                            child_cols[6].markdown(f"{avg_len:.1f}" if avg_len else "-")
+                            child_cols[7].markdown(f"{avg_wid:.1f}" if avg_wid else "-")
+                            child_cols[8].markdown(f"{avg_thk:.1f}" if avg_thk else "-")
+
+                        # Subtotal row for this KD material
+                        total_grade_pct = sum(g.get('Contribution_Pct', 0) for g in grade_contributions)
+                        subtotal_cols = st.columns([0.03, 0.15, 0.10, 0.12, 0.10, 0.12, 0.12, 0.12, 0.14])
+                        subtotal_cols[0].markdown("")
+                        subtotal_cols[1].markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;**Subtotal**")
+                        subtotal_cols[2].markdown(f"**{total_grade_pct:.1f}%**")
+                        subtotal_cols[3].markdown("")
+                        subtotal_cols[4].markdown("")
+                        subtotal_cols[5].markdown("")
+                        subtotal_cols[6].markdown("")
+                        subtotal_cols[7].markdown("")
+                        subtotal_cols[8].markdown("")
+                    else:
+                        st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;_No grade breakdown available_")
+                elif expanded and not has_grade_data:
+                    st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;_No grade breakdown data available_")
 
             # Totals row
             total_pct = sum(d['Contribution_Pct'] for d in distribution)
             total_bf = sum(d['Expected_BF_Output'] for d in distribution)
             st.markdown(f"**Total: {total_pct:.1f}% | {total_bf:,.0f} BF**")
+
+            # ================================================================
+            # SUNBURST CHART - Visual representation of KD → Grade distribution
+            # ================================================================
+            if has_grade_data:
+                st.markdown("---")
+                st.subheader("Visual Distribution (KD Material → Grade)")
+
+                # Build data for sunburst chart
+                sunburst_data = []
+                for kd_item in distribution:
+                    kd_mat = kd_item['KD_Material']
+                    kd_pct = kd_item['Contribution_Pct']
+                    kd_bf = kd_item['Expected_BF_Output']
+
+                    # Get grade breakdown for this KD material
+                    if has_raw_data:
+                        grades = get_ks_grade_contributions_for_kd(
+                            kd_material=kd_mat,
+                            ks_material=result['ks_material'],
+                            plant=result['plant'],
+                            kd_contrib_pct=kd_pct,
+                            df_261_raw=df_261_raw,
+                            df_101_raw=df_101_raw
+                        )
+                    else:
+                        grades = get_ks_grade_contributions_for_kd_from_precomputed(
+                            kd_material=kd_mat,
+                            ks_material=result['ks_material'],
+                            plant=result['plant'],
+                            kd_contrib_pct=kd_pct,
+                            precomputed_data=precomputed_data
+                        )
+
+                    if grades:
+                        for g in grades:
+                            grade_pct = g.get('Contribution_Pct', 0)
+                            # Calculate expected BF for this grade
+                            grade_expected_bf = kd_bf * (grade_pct / kd_pct) if kd_pct > 0 else 0
+                            sunburst_data.append({
+                                'KD_Material': kd_mat,
+                                'Grade': g.get('Grade', 'Unknown'),
+                                'Expected_BF': grade_expected_bf,
+                                'Contribution_Pct': grade_pct
+                            })
+                    else:
+                        # No grade breakdown - add KD material as single entry
+                        sunburst_data.append({
+                            'KD_Material': kd_mat,
+                            'Grade': 'All Grades',
+                            'Expected_BF': kd_bf,
+                            'Contribution_Pct': kd_pct
+                        })
+
+                if sunburst_data:
+                    sunburst_df = pd.DataFrame(sunburst_data)
+
+                    # Create sunburst chart
+                    fig = px.sunburst(
+                        sunburst_df,
+                        path=['KD_Material', 'Grade'],
+                        values='Expected_BF',
+                        title=f'Expected Output Distribution: {result["ks_material"]} → KD Materials → Grades',
+                        color='Contribution_Pct',
+                        color_continuous_scale='Blues',
+                        hover_data={'Expected_BF': ':.0f', 'Contribution_Pct': ':.1f'}
+                    )
+
+                    fig.update_layout(
+                        height=500,
+                        margin=dict(t=50, l=0, r=0, b=0)
+                    )
+
+                    fig.update_traces(
+                        textinfo='label+percent entry',
+                        hovertemplate='<b>%{label}</b><br>Expected BF: %{value:,.0f}<br>Contribution: %{color:.1f}%<extra></extra>'
+                    )
+
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption("Inner ring: KD Materials | Outer ring: Grades | Click to zoom in")
 
             # Download button
             export_df = pd.DataFrame(distribution)
@@ -983,8 +1419,15 @@ def render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, 
                 mime="text/csv"
             )
 
+            # ================================================================
+            # EXPLANATION SECTION - Hidden per user request
+            # ================================================================
+            # st.markdown("---")
+            # with st.expander("How does this prediction work? (Click to learn more)", expanded=False):
+            #     ... (explanation content hidden)
 
-def render_kd_material_lookup_section(options, historical_data, df_261_raw=None, df_101_raw=None):
+
+def render_kd_material_lookup_section(options, historical_data, df_261_raw=None, df_101_raw=None, precomputed_data=None):
     """Render the KD Material Lookup section - find historical KD outputs for a KS input.
 
     Args:
@@ -992,6 +1435,7 @@ def render_kd_material_lookup_section(options, historical_data, df_261_raw=None,
         historical_data: Joined historical data (for distribution calculation)
         df_261_raw: RAW 261 CSV data (for accurate BFIN totals matching notebook)
         df_101_raw: RAW 101 CSV data (for accurate BFOUT totals matching notebook)
+        precomputed_data: Pre-computed statistics dict (for deployment mode)
     """
     st.subheader("KD Material Lookup: Find Output Materials")
     st.caption("Enter a KS (input) material to see which KD (output) materials it has historically produced")
@@ -1087,8 +1531,12 @@ def render_kd_material_lookup_section(options, historical_data, df_261_raw=None,
 
     # Find KD Materials button
     if st.button("Find KD Materials", type="primary", key="kd_lookup_btn", use_container_width=True):
-        if historical_data is None or len(historical_data) == 0:
-            st.error("No historical data available. Please ensure data files are loaded.")
+        # Check available data sources
+        has_historical = historical_data is not None and len(historical_data) > 0
+        has_precomputed_kd = precomputed_data is not None and 'kd_lookup' in precomputed_data
+
+        if not has_historical and not has_precomputed_kd:
+            st.error("No historical data available. Please ensure data files are loaded or pre-computed data exists.")
             return
 
         if kd_material == 'No materials found':
@@ -1096,23 +1544,36 @@ def render_kd_material_lookup_section(options, historical_data, df_261_raw=None,
             return
 
         with st.spinner("Looking up historical KD outputs..."):
-            # Get historical distribution
-            kd_distribution = get_historical_kd_distribution(
-                input_material=kd_material,
-                historical_data=historical_data,
-                input_thickness=kd_thickness,
-                input_grade=kd_grade,
-                input_species=kd_specie,
-                input_plant=kd_plant
-            )
+            # Get historical distribution - try precomputed first, then historical
+            if has_precomputed_kd:
+                kd_distribution = get_historical_kd_distribution_from_precomputed(
+                    input_material=kd_material,
+                    kd_lookup=precomputed_data['kd_lookup'],
+                    input_thickness=kd_thickness,
+                    input_grade=kd_grade,
+                    input_species=kd_specie,
+                    input_plant=kd_plant
+                )
+            else:
+                kd_distribution = get_historical_kd_distribution(
+                    input_material=kd_material,
+                    historical_data=historical_data,
+                    input_thickness=kd_thickness,
+                    input_grade=kd_grade,
+                    input_species=kd_specie,
+                    input_plant=kd_plant
+                )
 
             if not kd_distribution:
                 st.warning(f"No historical data found for material: **{kd_material}**")
                 st.info("Try removing the optional filters (Thickness, Species, Grade) or selecting a different material.")
                 return
 
-            # Calculate total historical BF Input/Output using RAW CSV data
-            # This matches the notebook approach - no cleaning/aggregation
+            # Calculate total historical BF Input/Output
+            total_hist_input_bf = 0
+            total_hist_output_bf = 0
+
+            # Option 1: Use RAW CSV data for accurate totals
             if df_261_raw is not None and df_101_raw is not None:
                 # Use RAW 261 data for BFIN (column names: MATERIAL, BFIN, PLANT, etc.)
                 filtered_261 = df_261_raw[df_261_raw['MATERIAL'] == kd_material].copy()
@@ -1133,10 +1594,16 @@ def render_kd_material_lookup_section(options, historical_data, df_261_raw=None,
                 if len(order_list) > 0:
                     filtered_101 = df_101_raw[df_101_raw['MANUFACTURINGORDER'].isin(order_list)]
                     total_hist_output_bf = filtered_101['BFOUT'].sum() if 'BFOUT' in filtered_101.columns else 0
-                else:
-                    total_hist_output_bf = 0
-            else:
-                # Fallback to joined data if raw data not available
+
+            # Option 2: Use pre-computed data (deployment mode)
+            elif has_precomputed_kd and kd_material in precomputed_data['kd_lookup']:
+                kd_data = precomputed_data['kd_lookup'][kd_material]
+                total_hist_output_bf = kd_data.get('total_bf_output', 0)
+                # Estimate input from output using average yield (~90%)
+                total_hist_input_bf = total_hist_output_bf / 0.9 if total_hist_output_bf > 0 else 0
+
+            # Option 3: Fallback to joined data
+            elif has_historical:
                 filtered_hist = historical_data[historical_data['Input_Material'] == kd_material]
                 if kd_thickness is not None and 'Input_Thickness' in filtered_hist.columns:
                     filtered_hist = filtered_hist[filtered_hist['Input_Thickness'] == kd_thickness]
@@ -2101,7 +2568,7 @@ def main():
     # Load artifacts for selected model year
     artifacts = load_model_artifacts(selected_model_year)
     # Load historical data for the selected year (also returns raw 261/101 data for KD lookup)
-    historical_data, df_261_raw, df_101_raw = load_historical_data(selected_model_year)
+    historical_data, df_261_raw, df_101_raw, precomputed_data = load_historical_data(selected_model_year)
 
     # Continue sidebar content
     with st.sidebar:
@@ -2134,28 +2601,28 @@ def main():
                 except:
                     pass
 
-            # Show model metrics
-            if artifacts['metrics']:
-                best_r2 = max(
-                    m.get('test_r2', m.get('R2', 0))
-                    for m in artifacts['metrics'].values()
-                    if isinstance(m, dict)
-                )
-                st.metric("Model R² Score", f"{best_r2:.4f}")
+            # Model metrics section hidden
+            # if artifacts['metrics']:
+            #     best_r2 = max(
+            #         m.get('test_r2', m.get('R2', 0))
+            #         for m in artifacts['metrics'].values()
+            #         if isinstance(m, dict)
+            #     )
+            #     st.metric("Model R² Score", f"{best_r2:.4f}")
 
-            # Show classifier info if available
-            if artifacts.get('classifier') is not None:
-                st.success("Output Classifier Loaded")
-                classifier_metrics = artifacts.get('classifier_metrics', {})
-                if classifier_metrics:
-                    best_acc = max(
-                        m.get('accuracy', 0)
-                        for m in classifier_metrics.values()
-                        if isinstance(m, dict)
-                    )
-                    st.metric("Classifier Accuracy", f"{best_acc:.2%}")
-            else:
-                st.warning("Output Classifier not trained")
+            # Classifier info section hidden
+            # if artifacts.get('classifier') is not None:
+            #     st.success("Output Classifier Loaded")
+            #     classifier_metrics = artifacts.get('classifier_metrics', {})
+            #     if classifier_metrics:
+            #         best_acc = max(
+            #             m.get('accuracy', 0)
+            #             for m in classifier_metrics.values()
+            #             if isinstance(m, dict)
+            #         )
+            #         st.metric("Classifier Accuracy", f"{best_acc:.2%}")
+            # else:
+            #     st.warning("Output Classifier not trained")
         else:
             st.warning("No model found for selected year")
             st.caption("Please select a different year or ensure model files exist")
@@ -2187,36 +2654,42 @@ def main():
     # Load dropdown options for reverse prediction
     options = load_dropdown_options()
 
-    # Prediction Mode Selection
-    st.header("1. Select Prediction Mode")
-    prediction_mode = st.radio(
-        "Choose prediction type:",
-        [
-            "KD Material Lookup (Find KD Outputs)",
-            "Material Level Forward Prediction",
-            "Advanced Forward Prediction",
-            "Forward Prediction (Input -> Output)",
-            "Reverse Prediction (Output -> Input)"
-        ],
-        horizontal=True,
-        help="KD Lookup: Find historical KD outputs. Material Level: Statistical prediction from historical data. Advanced: ML model for yield + statistical distribution. Forward: Full ML prediction. Reverse: Calculate required input."
-    )
+    # Prediction Mode Selection - Only Advanced Forward Prediction visible
+    # st.header("1. Select Prediction Mode")
+    prediction_mode = "Advanced Forward Prediction"  # Fixed to Advanced Forward Prediction only
+    # Radio buttons hidden - other modes disabled
+    # prediction_mode = st.radio(
+    #     "Choose prediction type:",
+    #     [
+    #         "Sample Data Test",
+    #         "KD Material Lookup (Find KD Outputs)",
+    #         "Advanced Forward Prediction",
+    #         "Reverse Prediction (Output -> Input)"
+    #     ],
+    #     horizontal=True,
+    #     help="Sample Data Test: Test model with sample_261/101 files. KD Lookup: Find historical KD outputs. Advanced: ML + statistical prediction. Reverse: Calculate required input."
+    # )
 
     st.markdown("---")
 
+    if prediction_mode == "Sample Data Test":
+        # Sample Data Test Section
+        render_sample_data_test_section(model, encoders, feature_columns)
+        return  # Exit early for sample data test mode
+
     if prediction_mode == "KD Material Lookup (Find KD Outputs)":
         # KD Material Lookup Section
-        render_kd_material_lookup_section(options, historical_data, df_261_raw, df_101_raw)
+        render_kd_material_lookup_section(options, historical_data, df_261_raw, df_101_raw, precomputed_data)
         return  # Exit early for KD lookup mode
 
     if prediction_mode == "Material Level Forward Prediction":
         # Material Level Forward Prediction Section (Yield Recommendation Engine)
-        render_material_level_forward_prediction_section(options, df_261_raw, df_101_raw)
+        render_material_level_forward_prediction_section(options, df_261_raw, df_101_raw, precomputed_data)
         return  # Exit early for this mode
 
     if prediction_mode == "Advanced Forward Prediction":
         # Advanced Forward Prediction Section (ML + Statistical Hybrid)
-        render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns)
+        render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns, precomputed_data)
         return  # Exit early for this mode
 
     if prediction_mode == "Reverse Prediction (Output -> Input)":
