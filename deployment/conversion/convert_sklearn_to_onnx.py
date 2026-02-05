@@ -28,9 +28,9 @@ def convert_model(year: str = "2024"):
     # Define input shape
     initial_type = [('X', FloatTensorType([None, n_features]))]
 
-    # Convert to ONNX
-    print("Converting to ONNX...")
-    onnx_model = convert_sklearn(model, initial_types=initial_type)
+    # Convert to ONNX with opset version 17 (widely supported)
+    print("Converting to ONNX with opset version 17...")
+    onnx_model = convert_sklearn(model, initial_types=initial_type, target_opset=17)
 
     # Create output directory
     output_dir = base_dir / f"deployment/models/{year}"
