@@ -1,13 +1,15 @@
 version: '3.8'
 
 services:
-  yield-api:
+  # ==========================================================================
+  # 2024 Model Services
+  # ==========================================================================
+  yield-2024-api:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: yield-predictor
+      dockerfile: Dockerfile.api
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       - MODEL_YEAR=2024
     restart: unless-stopped
@@ -16,3 +18,181 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  yield-2024-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://yield-2024-api:8000
+    restart: unless-stopped
+    depends_on:
+      - yield-2024-api
+
+  # ==========================================================================
+  # 2025 Model Services
+  # ==========================================================================
+  yield-2025-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8002:8000"
+    environment:
+      - MODEL_YEAR=2025
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  yield-2025-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8502:8501"
+    environment:
+      - API_URL=http://yield-2025-api:8000
+    restart: unless-stopped
+    depends_on:
+      - yield-2025-api
+
+  # ==========================================================================
+  # 2-Year Model Services (enable with: docker-compose --profile future up)
+  # ==========================================================================
+  yield-2year-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8003:8000"
+    environment:
+      - MODEL_YEAR=2year
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - future
+
+  yield-2year-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8503:8501"
+    environment:
+      - API_URL=http://yield-2year-api:8000
+    restart: unless-stopped
+    depends_on:
+      - yield-2year-api
+    profiles:
+      - future
+
+  # ==========================================================================
+  # 5-Year Model Services (enable with: docker-compose --profile future up)
+  # ==========================================================================
+  yield-5year-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8004:8000"
+    environment:
+      - MODEL_YEAR=5year
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - future
+
+  yield-5year-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8504:8501"
+    environment:
+      - API_URL=http://yield-5year-api:8000
+    restart: unless-stopped
+    depends_on:
+      - yield-5year-api
+    profiles:
+      - future
+
+  # ==========================================================================
+  # 6-Month Model Services (enable with: docker-compose --profile future up)
+  # ==========================================================================
+  yield-6month-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8005:8000"
+    environment:
+      - MODEL_YEAR=6month
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - future
+
+  yield-6month-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8505:8501"
+    environment:
+      - API_URL=http://yield-6month-api:8000
+    restart: unless-stopped
+    depends_on:
+      - yield-6month-api
+    profiles:
+      - future
+
+  # ==========================================================================
+  # Multi-Year Model Services (enable with: docker-compose --profile future up)
+  # ==========================================================================
+  yield-multi-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8006:8000"
+    environment:
+      - MODEL_YEAR=multi
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - future
+
+  yield-multi-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8506:8501"
+    environment:
+      - API_URL=http://yield-multi-api:8000
+    restart: unless-stopped
+    depends_on:
+      - yield-multi-api
+    profiles:
+      - future
