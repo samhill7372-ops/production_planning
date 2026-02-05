@@ -26,11 +26,8 @@ RUN chown -R appuser:appuser /app
 # Switch to non-root user
 USER appuser
 
-# Expose port (Railway uses dynamic PORT)
+# Expose port
 EXPOSE 8000
 
-# Set default port (Railway overrides with $PORT)
-ENV PORT=8000
-
-# Run with dynamic port from Railway
-CMD uvicorn main:app --host 0.0.0.0 --port $PORT --workers 4
+# Run on port 8000 (hardcoded for Railway compatibility)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
