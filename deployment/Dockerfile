@@ -26,12 +26,11 @@ RUN chown -R appuser:appuser /app
 # Switch to non-root user
 USER appuser
 
-# Expose port
+# Expose port (Railway uses dynamic PORT)
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+# Set default port (Railway overrides with $PORT)
+ENV PORT=8000
 
-# Run with 4 workers (handles ~50+ concurrent requests)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Run with dynamic port from Railway
+CMD uvicorn main:app --host 0.0.0.0 --port $PORT --workers 4
