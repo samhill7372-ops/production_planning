@@ -23,8 +23,11 @@ COPY deployment/models/ /app/models/
 # Copy 2year model (Advanced Prediction) from root models/
 COPY models/2year/ /app/models/2year/
 
-# Copy multi_output models (XGBoost) from root models/
-COPY models/multi_output/ /app/models/multi_output/
+# Copy multi_output models (XGBoost) — split parts reassembled here
+COPY models/multi_output/baseline_yield_model.part_* /app/models/multi_output/
+COPY models/multi_output/training_template.joblib /app/models/multi_output/
+RUN cat /app/models/multi_output/baseline_yield_model.part_* > /app/models/multi_output/baseline_yield_model.joblib && \
+    rm /app/models/multi_output/baseline_yield_model.part_*
 
 # Set ownership
 RUN chown -R appuser:appuser /app

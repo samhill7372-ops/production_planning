@@ -24,7 +24,11 @@ COPY .streamlit/ /app/.streamlit/
 COPY models/2024/ /app/models/2024/
 COPY models/2025/ /app/models/2025/
 COPY models/2year/ /app/models/2year/
-COPY models/multi_output/ /app/models/multi_output/
+# Multi_output: reassemble split parts into single file
+COPY models/multi_output/baseline_yield_model.part_* /app/models/multi_output/
+COPY models/multi_output/training_template.joblib /app/models/multi_output/
+RUN cat /app/models/multi_output/baseline_yield_model.part_* > /app/models/multi_output/baseline_yield_model.joblib && \
+    rm /app/models/multi_output/baseline_yield_model.part_*
 
 # Copy root-level model files (all_models, output_classifier, encoders, etc.)
 COPY models/*.joblib /app/models/
