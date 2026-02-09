@@ -1,0 +1,38 @@
+# Production Dockerfile for FastAPI Yield Prediction API
+# Build context: project root (access to deployment/ and models/)
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser
+
+WORKDIR /app
+
+# Install dependencies (cache layer)
+COPY deployment/api/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy API application code
+COPY deployment/api/ /app/
+
+# Copy ONNX models (2024, 2025 from deployment/models/)
+COPY deployment/models/ /app/models/
+
+# Copy 2year model (Advanced Prediction) from root models/
+COPY models/2year/ /app/models/2year/
+
+# Copy multi_output models (XGBoost) from root models/
+COPY models/multi_output/ /app/models/multi_output/
+
+# Set ownership
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+EXPOSE 8000
+
+# Use PORT from Railway, default to 8000
+CMD sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 4"

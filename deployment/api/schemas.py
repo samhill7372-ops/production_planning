@@ -1,6 +1,6 @@
 """Pydantic models for request/response validation."""
 from typing import List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ============== Simple Prediction ==============
@@ -105,3 +105,76 @@ class KDPredictionResponse(BaseModel):
     kd_outputs: List[KDOutput] = Field(..., description="List of KD materials with grade breakdown")
     latency_ms: float = Field(..., description="Processing latency in milliseconds")
     model_version: str = Field(..., description="Model version used")
+
+
+# ============== Multi-Output Prediction ==============
+
+class TallyRecord(BaseModel):
+    """Single 261 consumption tally record."""
+    MANUFACTURINGORDER: str = Field(..., description="Manufacturing order number")
+    MATERIALSPECIE: Optional[str] = Field(None, description="Material species (e.g. HM, SM, SPF)")
+    MATERIALTHICKNESS: Optional[str] = Field(None, description="Material thickness")
+    PLANT: Optional[str] = Field(None, description="Plant code")
+    TALLYGRADE: Optional[str] = Field(None, description="Tally grade (e.g. 1C, 2C)")
+    TALLYLENGTH: float = Field(..., description="Tally length in inches")
+    TALLYWIDTH: float = Field(..., description="Tally width in inches")
+    BFIN: float = Field(..., description="Board feet input")
+    GOODSMOVEMENTTYPE: Optional[str] = Field("261", description="Goods movement type")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "MANUFACTURINGORDER": "1088876",
+                "MATERIALSPECIE": "HM",
+                "MATERIALTHICKNESS": "4",
+                "PLANT": "1M02",
+                "TALLYGRADE": "1C",
+                "TALLYLENGTH": 144.0,
+                "TALLYWIDTH": 72.0,
+                "BFIN": 700.0,
+                "GOODSMOVEMENTTYPE": "261"
+            }
+        }
+
+
+class MultiOutputRequest(BaseModel):
+    """Request: list of 261 tally records (one or many manufacturing orders)."""
+    records: List[TallyRecord] = Field(..., min_length=1, max_length=10000, description="List of 261 consumption tally records")
+
+    @model_validator(mode="after")
+    def validate_records(self):
+        if not self.records:
+            raise ValueError("At least one tally record is required")
+        return self
+
+
+class BinOutput(BaseModel):
+    """Single output bin (Grade/Length/Width combination)."""
+    grade: str = Field(..., description="Output grade")
+    length: str = Field(..., description="Output length")
+    width: str = Field(..., description="Output width")
+    boards: int = Field(..., description="Predicted board count")
+
+
+class OrderResult(BaseModel):
+    """Prediction result for a single manufacturing order."""
+    manufacturing_order: str = Field(..., description="Manufacturing order number")
+    total_bfin: float = Field(..., description="Total input board feet")
+    yield_factor: float = Field(..., description="Predicted yield factor (0-1)")
+    predicted_output: float = Field(..., description="Predicted output board feet")
+    total_boards: int = Field(..., description="Total predicted output boards")
+    distribution: List[BinOutput] = Field(..., description="Board distribution across Grade/Length/Width bins")
+
+
+class MultiOutputResponse(BaseModel):
+    """Response: per-order predictions + overall summary."""
+    num_orders: int = Field(..., description="Number of manufacturing orders processed")
+    total_bfin: float = Field(..., description="Total input board feet across all orders")
+    avg_yield_factor: float = Field(..., description="Average yield factor across orders")
+    total_predicted_output: float = Field(..., description="Total predicted output board feet")
+    total_boards: int = Field(..., description="Total predicted boards across all orders")
+    orders: List[OrderResult] = Field(..., description="Per-order prediction results")
+    latency_ms: float = Field(..., description="Processing latency in milliseconds")
+    model_version: str = Field(..., description="Model version identifier")
+    records_received: Optional[int] = Field(None, description="Total input records received")
+    records_processed: Optional[int] = Field(None, description="Records after 261 movement type filter")

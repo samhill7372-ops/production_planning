@@ -62,8 +62,10 @@ from src.prediction_utils import (
     get_advanced_forward_prediction_from_precomputed,
     get_historical_kd_distribution_from_precomputed,
     get_ks_grade_contributions_for_kd,
-    get_ks_grade_contributions_for_kd_from_precomputed
+    get_ks_grade_contributions_for_kd_from_precomputed,
+    get_batch_forward_prediction
 )
+from src.multi_output_prediction import run_prediction_all_orders as mo_predict_all_orders
 
 # Page configuration
 st.set_page_config(
@@ -120,16 +122,38 @@ CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
 
 
 def get_available_model_years():
-    """Get list of years with trained models."""
-    years = []
+    """Get list of years with trained models, including combined models."""
+    models = []
+    # Valid multi-year folder names
+    multi_year_folders = {'2year', '5year'}
+
     if os.path.exists(MODELS_DIR):
         for item in os.listdir(MODELS_DIR):
             item_path = os.path.join(MODELS_DIR, item)
-            if os.path.isdir(item_path) and item.isdigit():
+            if os.path.isdir(item_path):
                 # Check if model exists in this folder
                 if os.path.exists(os.path.join(item_path, "yield_model.joblib")):
-                    years.append(item)
-    return sorted(years)
+                    if item.isdigit() or item in multi_year_folders:
+                        models.append(item)
+
+    # Sort: single years first (ascending), then multi-year
+    def sort_key(x):
+        if x.isdigit():
+            return (0, int(x))
+        return (1, int(''.join(filter(str.isdigit, x)) or '99'))
+
+    return sorted(models, key=sort_key)
+
+
+def get_model_display_name(model_id: str) -> str:
+    """Convert model folder name to user-friendly display name."""
+    display_names = {
+        '2year': '2 years (2024 and 2025)',
+        '5year': '5 years (historical)',
+    }
+    if model_id.isdigit():
+        return model_id
+    return display_names.get(model_id, model_id)
 
 
 @st.cache_resource
@@ -199,6 +223,24 @@ def load_model_artifacts(model_year: str = None):
         return None
 
 
+@st.cache_resource
+def load_multi_output_model():
+    """Load the multi-output yield prediction model and template."""
+    model_dir = os.path.join(MODELS_DIR, "multi_output")
+    model_path = os.path.join(model_dir, "baseline_yield_model.joblib")
+    template_path = os.path.join(model_dir, "training_template.joblib")
+    if not os.path.exists(model_path) or not os.path.exists(template_path):
+        return None
+    try:
+        return {
+            'model_bundle': joblib.load(model_path),
+            'template_df': joblib.load(template_path),
+        }
+    except Exception as e:
+        st.error(f"Error loading multi-output model: {e}")
+        return None
+
+
 @st.cache_data
 def load_historical_data(selected_year: str = None):
     """Load and prepare historical data for the selected year.
@@ -216,7 +258,12 @@ def load_historical_data(selected_year: str = None):
     """
     # Determine which years to load
     if selected_year:
-        years_to_load = [selected_year]
+        if selected_year == '2year':
+            years_to_load = ['2024', '2025']
+        elif selected_year == '5year':
+            years_to_load = get_available_years()
+        else:
+            years_to_load = [selected_year]
     else:
         years_to_load = get_available_years()
 
@@ -1051,6 +1098,302 @@ def render_material_level_forward_prediction_section(options, df_261_raw, df_101
                 data=csv,
                 file_name=f"kd_prediction_{result['ks_material']}_{result['plant']}.csv",
                 mime="text/csv"
+            )
+
+
+def render_batch_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns, precomputed_data=None):
+    """Render the Batch Prediction section for multiple materials.
+
+    Predict yield for multiple materials at once with full KD breakdown.
+    Uses historical averages for each material (same as single prediction).
+    """
+    st.subheader("Batch Prediction")
+    st.caption("Predict yield for multiple materials at once with full KD breakdown")
+
+    st.markdown("**Add multiple materials for batch yield prediction**")
+    st.info("Uses historical averages for each material (same as single Advanced Forward Prediction)")
+
+    # Initialize session state for batch materials
+    if 'batch_forward_materials' not in st.session_state:
+        st.session_state.batch_forward_materials = [0]  # Track number of rows
+
+    # Add/Remove buttons
+    col_add, col_remove, col_clear = st.columns(3)
+    with col_add:
+        if st.button("+ Add Material Row", key="batch_add"):
+            st.session_state.batch_forward_materials.append(len(st.session_state.batch_forward_materials))
+            st.rerun()
+    with col_remove:
+        if st.button("- Remove Last Row", key="batch_remove"):
+            if len(st.session_state.batch_forward_materials) > 1:
+                st.session_state.batch_forward_materials.pop()
+                st.rerun()
+    with col_clear:
+        if st.button("Clear All", key="batch_clear"):
+            st.session_state.batch_forward_materials = [0]
+            if 'batch_results' in st.session_state:
+                del st.session_state.batch_results
+            st.rerun()
+
+    # Get option lists
+    plant_options = options.get('Input_Plant', ['1Y01'])
+    material_options = options.get('Input_Material', [])
+
+    # Render simplified input rows (only Plant, Material, Input BF)
+    st.markdown("---")
+    for i in range(len(st.session_state.batch_forward_materials)):
+        c1, c2, c3 = st.columns([2, 3, 2])
+        with c1:
+            st.selectbox(f"Plant {i+1}", plant_options, key=f"batch_plant_{i}")
+        with c2:
+            st.selectbox(f"Material {i+1}", material_options, key=f"batch_material_{i}")
+        with c3:
+            st.number_input(f"Input BF {i+1}", min_value=0.0, value=10000.0, step=1000.0, key=f"batch_bf_{i}")
+
+    st.markdown("---")
+
+    # Batch Predict button
+    if st.button("Predict All Materials", type="primary", key="batch_predict_btn", use_container_width=True):
+        if model is None:
+            st.error("ML model not available.")
+        elif df_261_raw is None or df_101_raw is None:
+            st.error("Historical data not available for KD breakdown.")
+        else:
+            # Collect all material inputs (simplified - only plant, material, input_bf)
+            materials_list = []
+            for i in range(len(st.session_state.batch_forward_materials)):
+                materials_list.append({
+                    'plant': st.session_state.get(f"batch_plant_{i}", '1Y01'),
+                    'material': st.session_state.get(f"batch_material_{i}", ''),
+                    'input_bf': st.session_state.get(f"batch_bf_{i}", 10000.0)
+                })
+
+            with st.spinner("Running batch predictions with KD breakdown..."):
+                results = get_batch_forward_prediction(
+                    materials_list,
+                    df_261_raw,
+                    df_101_raw,
+                    model,
+                    encoders,
+                    feature_columns,
+                    min_order_count=5
+                )
+                st.session_state.batch_results = results
+
+    # Display batch results
+    if 'batch_results' in st.session_state and st.session_state.batch_results:
+        st.markdown("### Batch Prediction Results")
+
+        batch_results = st.session_state.batch_results
+
+        # Overall summary
+        total_input_bf = sum(r.get('input_bf', 0) for r in batch_results)
+        total_output_bf = sum(r.get('predicted_output_bf', 0) for r in batch_results)
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            st.metric("Total Materials", len(batch_results))
+        with col_s2:
+            st.metric("Total Input BF", f"{total_input_bf:,.0f}")
+        with col_s3:
+            st.metric("Total Predicted Output BF", f"{total_output_bf:,.0f}")
+
+        # Display each material with expandable KD breakdown
+        for i, result in enumerate(batch_results):
+            material_name = result.get('input_material', result.get('ks_material', f'Material {i+1}'))
+            plant_name = result.get('input_plant', result.get('plant', ''))
+
+            if 'error' in result:
+                st.warning(f"**{material_name} @ {plant_name}**: {result['error']}")
+                continue
+
+            with st.expander(f"**{material_name}** @ {plant_name} - Yield: {result.get('ml_yield_pct', 0):.1f}%", expanded=False):
+                # Summary metrics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("ML Predicted Yield", f"{result.get('ml_yield_pct', 0):.1f}%")
+                with col2:
+                    st.metric("Input BF", f"{result.get('input_bf', 0):,.0f}")
+                with col3:
+                    st.metric("Predicted Output BF", f"{result.get('predicted_output_bf', 0):,.0f}")
+
+                # Historical context
+                col4, col5, col6 = st.columns(3)
+                with col4:
+                    st.metric("Historical Yield", f"{result.get('historical_yield_pct', 0):.1f}%")
+                with col5:
+                    st.metric("Historical Orders", f"{result.get('historical_orders', 0):,}")
+                with col6:
+                    st.metric("Historical Output BF", f"{result.get('total_hist_output_bf', 0):,.0f}")
+
+                # KD Distribution table
+                kd_dist = result.get('kd_distribution', [])
+                if kd_dist:
+                    st.markdown("**KD Material Distribution:**")
+                    kd_df = pd.DataFrame(kd_dist)
+                    # Select relevant columns
+                    display_cols = ['KD_Material', 'Contribution_Pct', 'Expected_BF_Output', 'Historical_Orders', 'Historical_BF_Output']
+                    display_cols = [c for c in display_cols if c in kd_df.columns]
+                    if display_cols:
+                        st.dataframe(kd_df[display_cols], use_container_width=True)
+
+        # CSV export for summary
+        st.markdown("---")
+        summary_data = []
+        for result in batch_results:
+            if 'error' not in result:
+                summary_data.append({
+                    'Plant': result.get('input_plant', result.get('plant', '')),
+                    'Material': result.get('input_material', result.get('ks_material', '')),
+                    'Input_BF': result.get('input_bf', 0),
+                    'ML_Yield_Pct': result.get('ml_yield_pct', 0),
+                    'Predicted_Output_BF': result.get('predicted_output_bf', 0),
+                    'Historical_Yield_Pct': result.get('historical_yield_pct', 0),
+                    'Historical_Orders': result.get('historical_orders', 0)
+                })
+        if summary_data:
+            summary_df = pd.DataFrame(summary_data)
+            csv = summary_df.to_csv(index=False)
+            st.download_button(
+                "Download Summary CSV",
+                csv,
+                "batch_predictions_summary.csv",
+                "text/csv",
+                key="batch_download"
+            )
+
+
+def render_multi_output_prediction_section():
+    """Render the Multi-Output Prediction section.
+
+    Users upload a 261 consumption CSV, select a manufacturing order,
+    and get detailed output board distribution (Grade/Length/Width/Boards).
+    """
+    st.subheader("Multi-Output Prediction")
+    st.caption("Upload 261 consumption data to predict detailed output board distribution")
+
+    # Load multi-output model
+    mo_artifacts = load_multi_output_model()
+    if mo_artifacts is None:
+        st.error("Multi-output model not found. Ensure baseline_yield_model.joblib and training_template.joblib exist in models/multi_output/")
+        return
+
+    model_bundle = mo_artifacts['model_bundle']
+    template_df = mo_artifacts['template_df']
+
+    st.info("""
+    **Required CSV columns:** MANUFACTURINGORDER, BFIN, TALLYLENGTH, TALLYWIDTH
+    **Recommended columns:** MATERIALSPECIE, MATERIALTHICKNESS, PLANT, TALLYGRADE, GOODSMOVEMENTTYPE
+    """)
+
+    # File upload
+    uploaded_file = st.file_uploader(
+        "Upload your 261 consumption CSV file:",
+        type=["csv"],
+        key="mo_file_upload",
+        help="CSV should contain 261 consumption records with columns: MANUFACTURINGORDER, BFIN, TALLYLENGTH, TALLYWIDTH, etc."
+    )
+
+    if uploaded_file is not None:
+        df_upload = pd.read_csv(uploaded_file)
+
+        # Validate required columns
+        required_cols = ["BFIN", "TALLYLENGTH", "TALLYWIDTH", "MANUFACTURINGORDER"]
+        recommended_cols = ["MATERIALSPECIE", "MATERIALTHICKNESS", "PLANT", "TALLYGRADE", "GOODSMOVEMENTTYPE"]
+
+        missing_required = [col for col in required_cols if col not in df_upload.columns]
+        missing_recommended = [col for col in recommended_cols if col not in df_upload.columns]
+
+        if missing_required:
+            st.error(f"Missing required columns: {', '.join(missing_required)}")
+            return
+
+        if missing_recommended:
+            st.warning(f"Missing recommended columns (predictions may be less accurate): {', '.join(missing_recommended)}")
+
+        # Extract unique manufacture orders and compute stats
+        unique_orders = sorted(df_upload["MANUFACTURINGORDER"].unique())
+        order_stats = df_upload.groupby("MANUFACTURINGORDER").agg(
+            rows=("MANUFACTURINGORDER", "count"),
+            bfin=("BFIN", "sum")
+        )
+
+        # Manufacture order dropdown
+        st.markdown("---")
+        st.markdown("**Select Manufacturing Order**")
+        selected_order = st.selectbox(
+            "Choose a manufacturing order to analyze:",
+            options=unique_orders,
+            format_func=lambda x: f"{x} ({order_stats.loc[x, 'rows']:,.0f} rows, {order_stats.loc[x, 'bfin']:,.0f} BFIN)",
+            key="mo_order_select"
+        )
+
+        # Filter dataframe to selected order
+        df_filtered = df_upload[df_upload["MANUFACTURINGORDER"] == selected_order]
+
+        st.markdown("**Input Data Preview**")
+        st.dataframe(df_filtered.head(10), use_container_width=True)
+
+        total_bfin_preview = df_filtered["BFIN"].sum()
+        st.caption(f"Selected order: {selected_order} | Rows: {len(df_filtered):,} | Total BFIN: {total_bfin_preview:,.0f}")
+
+        # Run prediction
+        st.markdown("---")
+        if st.button("Run Multi-Output Prediction", type="primary", key="mo_predict_btn", use_container_width=True):
+            progress_bar = st.progress(0, text="Starting prediction...")
+            result_df, summary = mo_predict_all_orders(
+                df_filtered,
+                model_bundle,
+                template_df,
+                progress_bar
+            )
+            progress_bar.empty()
+
+            if result_df is not None and summary is not None:
+                st.session_state.mo_result = result_df
+                st.session_state.mo_summary = summary
+
+        # Display results (persistent via session state)
+        if 'mo_result' in st.session_state and st.session_state.mo_result is not None:
+            result_df = st.session_state.mo_result
+            summary = st.session_state.mo_summary
+
+            st.markdown("---")
+
+            # Summary metrics
+            st.markdown("### Summary")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Orders Processed", f"{summary['num_orders']:,}")
+            col2.metric("Total BFIN", f"{summary['total_bfin']:,.0f}")
+            col3.metric("Avg Yield Factor", f"{summary['yield_factor']:.2%}")
+            col4.metric("Predicted Output", f"{summary['predicted_output']:,.0f}")
+            col5.metric("Total Boards", f"{summary['total_boards']:,}")
+
+            st.markdown("---")
+
+            # Results table and chart side by side
+            col_table, col_chart = st.columns([1, 1])
+
+            with col_table:
+                st.markdown("**Predicted Distribution**")
+                st.dataframe(result_df, use_container_width=True, height=400)
+
+            with col_chart:
+                st.markdown("**Top Bins by Volume**")
+                if not result_df.empty:
+                    chart_df = result_df.head(15).copy()
+                    chart_df["Bin"] = chart_df["Grade"] + "_" + chart_df["Length"].astype(str) + "_" + chart_df["Width"].astype(str)
+                    st.bar_chart(chart_df.set_index("Bin")["Boards"])
+
+            # Download button
+            st.markdown("---")
+            csv_output = result_df.to_csv(index=False)
+            st.download_button(
+                label="Download Predictions as CSV",
+                data=csv_output,
+                file_name="predicted_output.csv",
+                mime="text/csv",
+                key="mo_download"
             )
 
 
@@ -2555,12 +2898,24 @@ def main():
         # =====================================================================
         if available_model_years:
             st.header("Model Selection")
-            selected_model_year = st.selectbox(
+            # Create display options mapping
+            display_options = {get_model_display_name(m): m for m in available_model_years}
+            display_names = list(display_options.keys())
+
+            # Default to 2025 if available, otherwise last option
+            default_index = len(display_names) - 1
+            for i, model_id in enumerate(available_model_years):
+                if model_id == '2025':
+                    default_index = i
+                    break
+
+            selected_display = st.selectbox(
                 "Select prediction model:",
-                options=available_model_years,
-                index=len(available_model_years) - 1,  # Default to latest year
-                help="Choose which year's trained model to use for predictions"
+                options=display_names,
+                index=default_index,  # Default to 2025
+                help="Choose which trained model to use for predictions"
             )
+            selected_model_year = display_options[selected_display]
             st.markdown("---")
         else:
             selected_model_year = None
@@ -2580,7 +2935,8 @@ def main():
         if artifacts:
             # Show which model year is selected
             if selected_model_year:
-                st.success(f"Using {selected_model_year} Model")
+                display_name = get_model_display_name(selected_model_year)
+                st.success(f"Using: {display_name}")
             else:
                 st.success("Model Loaded")
 
@@ -2654,21 +3010,18 @@ def main():
     # Load dropdown options for reverse prediction
     options = load_dropdown_options()
 
-    # Prediction Mode Selection - Only Advanced Forward Prediction visible
-    # st.header("1. Select Prediction Mode")
-    prediction_mode = "Advanced Forward Prediction"  # Fixed to Advanced Forward Prediction only
-    # Radio buttons hidden - other modes disabled
-    # prediction_mode = st.radio(
-    #     "Choose prediction type:",
-    #     [
-    #         "Sample Data Test",
-    #         "KD Material Lookup (Find KD Outputs)",
-    #         "Advanced Forward Prediction",
-    #         "Reverse Prediction (Output -> Input)"
-    #     ],
-    #     horizontal=True,
-    #     help="Sample Data Test: Test model with sample_261/101 files. KD Lookup: Find historical KD outputs. Advanced: ML + statistical prediction. Reverse: Calculate required input."
-    # )
+    # Prediction Mode Selection
+    st.header("1. Select Prediction Mode")
+    prediction_mode = st.radio(
+        "Choose prediction type:",
+        [
+            "Advanced Forward Prediction",
+            "Batch Prediction",
+            "Multi-Output Prediction"
+        ],
+        horizontal=True,
+        help="Advanced: Single material ML + statistical prediction. Batch: Multiple materials at once. Multi-Output: Upload CSV for detailed board-level output distribution."
+    )
 
     st.markdown("---")
 
@@ -2690,6 +3043,16 @@ def main():
     if prediction_mode == "Advanced Forward Prediction":
         # Advanced Forward Prediction Section (ML + Statistical Hybrid)
         render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns, precomputed_data)
+        return  # Exit early for this mode
+
+    if prediction_mode == "Batch Prediction":
+        # Batch Prediction Section (Multiple Materials)
+        render_batch_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns, precomputed_data)
+        return  # Exit early for this mode
+
+    if prediction_mode == "Multi-Output Prediction":
+        # Multi-Output Prediction Section (CSV Upload + Board Distribution)
+        render_multi_output_prediction_section()
         return  # Exit early for this mode
 
     if prediction_mode == "Reverse Prediction (Output -> Input)":

@@ -1,77 +1,126 @@
-"""FastAPI application with ONNX model loaded at startup."""
+"""FastAPI application — loads ALL model years at startup."""
+import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from schemas import (
     PredictionRequest, PredictionResponse, HealthResponse, ErrorResponse,
-    KDPredictionRequest, KDPredictionResponse
+    KDPredictionRequest, KDPredictionResponse,
+    MultiOutputRequest, MultiOutputResponse
 )
 from inference import ONNXModelService
 from preprocessing import Preprocessor
 from kd_service import KDDistributionService
+from multi_output_service import MultiOutputService
 
-# Global instances (loaded once at startup)
-model_service: ONNXModelService = None
-preprocessor: Preprocessor = None
-kd_service: KDDistributionService = None
-model_version: str = None
+# ─── Global state (loaded once at startup) ────────────────────────────
+# One entry per model year: {"2024": ..., "2025": ..., "2year": ...}
+model_services: dict = {}
+preprocessors: dict = {}
+kd_services: dict = {}
+available_models: list = []
+
+# Multi-output is a single model (not year-specific)
+mo_service: MultiOutputService = None
+
+# Model years to attempt loading
+MODEL_YEARS = ["2024", "2025", "2year"]
 
 # Confidence margin (2 * std from model metrics, ~3.94 RMSE)
 CONFIDENCE_MARGIN = 7.88
 
 
+def _resolve_model_dir(model_folder: str) -> str | None:
+    """Find model directory in Docker or local paths. Returns None if not found."""
+    # Docker path
+    docker_path = f"/app/models/{model_folder}"
+    if os.path.exists(docker_path):
+        return docker_path
+    # Local development path
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local_path = os.path.join(base_dir, "models", model_folder)
+    if os.path.exists(local_path):
+        return local_path
+    return None
+
+
+def _get_model_or_raise(model_year: str, service_dict: dict, service_name: str):
+    """Look up a model year in a service dict, raise 400 if not found."""
+    if model_year not in service_dict:
+        if model_year not in available_models:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid model_year '{model_year}'. Available: {available_models}",
+            )
+        raise HTTPException(
+            status_code=503,
+            detail=f"{service_name} not available for model_year '{model_year}'",
+        )
+    return service_dict[model_year]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model and encoders ONCE at startup."""
-    global model_service, preprocessor, kd_service, model_version
+    """Load ALL model years and multi-output model at startup."""
+    global mo_service
 
-    # Support both MODEL_NAME (new multi-service) and MODEL_YEAR (legacy)
-    model_version = os.getenv("MODEL_NAME") or os.getenv("MODEL_YEAR", "2024")
+    # Load each year model
+    for year in MODEL_YEARS:
+        model_dir = _resolve_model_dir(year)
+        if model_dir is None:
+            print(f"Skipping model year {year} — directory not found")
+            continue
 
-    # For legacy MODEL_YEAR like "2024", map to model folder name
-    # This allows both MODEL_YEAR=2024 and MODEL_NAME=yield-2024 to work
-    model_folder = model_version
+        onnx_path = os.path.join(model_dir, "yield_model.onnx")
+        if not os.path.exists(onnx_path):
+            print(f"Skipping model year {year} — yield_model.onnx not found")
+            continue
 
-    # Support both Docker (/app/models) and local (./models) paths
-    if os.path.exists(f"/app/models/{model_folder}"):
-        model_dir = f"/app/models/{model_folder}"
-    else:
-        # Local development path
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        model_dir = os.path.join(base_dir, "models", model_folder)
+        try:
+            ms = ONNXModelService(onnx_path)
+            pp = Preprocessor(model_dir)
+            model_services[year] = ms
+            preprocessors[year] = pp
+            available_models.append(year)
+            print(f"Model {year} loaded successfully!")
 
-    print(f"Loading model from {model_dir}...")
-    model_service = ONNXModelService(f"{model_dir}/yield_model.onnx")
-    preprocessor = Preprocessor(model_dir)
+            # KD service (optional — needs historical_data_precomputed.joblib)
+            try:
+                kd = KDDistributionService(model_dir, model_service=ms, preprocessor=pp)
+                kd_services[year] = kd
+                print(f"  KD Distribution service loaded for {year}")
+            except FileNotFoundError as e:
+                print(f"  Warning: KD service not available for {year} — {e}")
 
-    # Load KD distribution service with ML model for yield prediction
+        except Exception as e:
+            print(f"Warning: Failed to load model year {year} — {e}")
+
+    print(f"Loaded {len(available_models)} model(s): {available_models}")
+
+    # Load Multi-Output model (separate two-step XGBoost model)
     try:
-        kd_service = KDDistributionService(
-            model_dir,
-            model_service=model_service,
-            preprocessor=preprocessor
-        )
-        print("KD Distribution service loaded successfully (with ML model)!")
-    except FileNotFoundError as e:
-        print(f"Warning: KD service not available - {e}")
-        kd_service = None
-
-    print(f"Model {model_version} loaded successfully!")
+        mo_dir = _resolve_model_dir("multi_output")
+        if mo_dir and os.path.exists(os.path.join(mo_dir, "baseline_yield_model.joblib")):
+            mo_service = MultiOutputService(mo_dir)
+            print(f"Multi-Output model loaded ({len(mo_service.bin_cols)} BIN categories)")
+        else:
+            print("Warning: Multi-Output model not found, /predict-multi-output will be unavailable")
+    except Exception as e:
+        print(f"Warning: Multi-Output model failed to load — {e}")
+        mo_service = None
 
     yield  # App runs here
-
-    # Cleanup (if needed)
     print("Shutting down...")
 
 
 app = FastAPI(
     title="Yield Prediction API",
-    description="Production ML inference service for material yield prediction",
-    version="1.0.0",
+    description="Production ML inference service — supports multiple model years (2024, 2025, 2year) and multi-output prediction",
+    version="2.0.0",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse, "description": "Bad Request"},
@@ -79,37 +128,38 @@ app = FastAPI(
     }
 )
 
-# CORS (adjust origins for your frontend)
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ============== Yield Prediction ==============
+
 @app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
-async def predict(request: PredictionRequest):
+async def predict(
+    request: PredictionRequest,
+    model_year: str = Query("2024", description="Model year: 2024, 2025, or 2year"),
+):
     """
     Predict yield percentage and output board feet.
 
-    Accepts raw material values (not encoded).
-    Returns prediction with confidence bounds and latency.
+    Use `model_year` query param to select which model to use.
+    Default: 2024.
     """
     start_time = time.perf_counter()
 
+    ms = _get_model_or_raise(model_year, model_services, "Model service")
+    pp = _get_model_or_raise(model_year, preprocessors, "Preprocessor")
+
     try:
-        # Encode raw values to features
-        features = preprocessor.encode(request)
-
-        # Run inference
-        yield_pct = model_service.predict(features)
-
-        # Calculate output
+        features = pp.encode(request)
+        yield_pct = ms.predict(features)
         output_bf = request.total_input_bf * (yield_pct / 100)
-
-        # Calculate latency
         latency_ms = (time.perf_counter() - start_time) * 1000
 
         return PredictionResponse(
@@ -118,22 +168,26 @@ async def predict(request: PredictionRequest):
             confidence_lower=round(max(0, yield_pct - CONFIDENCE_MARGIN), 2),
             confidence_upper=round(min(150, yield_pct + CONFIDENCE_MARGIN), 2),
             latency_ms=round(latency_ms, 2),
-            model_version=model_version
+            model_version=model_year,
         )
 
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
 
+# ============== Health & Info ==============
+
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health():
-    """Health check endpoint for container orchestration."""
+    """Health check — reports status of all loaded models."""
     return HealthResponse(
-        status="healthy" if model_service else "unhealthy",
-        model_loaded=model_service is not None,
-        model_version=model_version or "not loaded"
+        status="healthy" if available_models else "unhealthy",
+        model_loaded=len(available_models) > 0,
+        model_version=", ".join(available_models) if available_models else "none",
     )
 
 
@@ -142,16 +196,29 @@ async def root():
     """Root endpoint with API info."""
     return {
         "service": "Yield Prediction API",
-        "version": "1.0.0",
-        "model_version": model_version,
+        "version": "2.0.0",
+        "available_models": available_models,
+        "multi_output_available": mo_service is not None,
         "docs": "/docs",
         "health": "/health",
-        "predict": "/predict"
+    }
+
+
+@app.get("/models", tags=["Info"])
+async def list_models():
+    """List all available model years and capabilities."""
+    return {
+        "available_models": available_models,
+        "multi_output_available": mo_service is not None,
+        "kd_models": list(kd_services.keys()),
     }
 
 
 @app.get("/valid-values/{field}", tags=["Info"])
-async def get_valid_values(field: str):
+async def get_valid_values(
+    field: str,
+    model_year: str = Query("2024", description="Model year"),
+):
     """Get valid values for a categorical field."""
     field_map = {
         "input_material": "Input_Material",
@@ -163,59 +230,50 @@ async def get_valid_values(field: str):
     if field not in field_map:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown field: {field}. Valid fields: {list(field_map.keys())}"
+            detail=f"Unknown field: {field}. Valid fields: {list(field_map.keys())}",
         )
 
-    values = preprocessor.get_valid_values(field_map[field])
-    return {"field": field, "valid_values": values, "count": len(values)}
+    pp = _get_model_or_raise(model_year, preprocessors, "Preprocessor")
+    values = pp.get_valid_values(field_map[field])
+    return {"field": field, "model_year": model_year, "valid_values": values, "count": len(values)}
 
 
 # ============== KD Distribution Prediction ==============
 
 @app.post("/predict-kd", response_model=KDPredictionResponse, tags=["KD Prediction"])
-async def predict_kd(request: KDPredictionRequest):
+async def predict_kd(
+    request: KDPredictionRequest,
+    model_year: str = Query("2024", description="Model year: 2024, 2025, or 2year"),
+):
     """
     Predict KD material distribution with grade breakdown.
 
-    Returns multiple KD output materials with:
-    - Contribution percentages
-    - Expected output BF
-    - Grade-level breakdown (2C, 1C, PR, etc.)
-    - Dimensional details (length, width, thickness)
-
-    This matches the Streamlit app's KD Material Distribution table.
+    Use `model_year` query param to select which model to use.
     """
     start_time = time.perf_counter()
 
-    if kd_service is None:
-        raise HTTPException(
-            status_code=503,
-            detail="KD Distribution service not available. Missing historical_data_precomputed.joblib"
-        )
+    kd = _get_model_or_raise(model_year, kd_services, "KD Distribution service")
 
     try:
-        # Get KD distribution prediction
-        result = kd_service.get_kd_prediction(
+        result = kd.get_kd_prediction(
             input_material=request.input_material,
             plant=request.input_plant,
-            input_bf=request.total_input_bf
+            input_bf=request.total_input_bf,
         )
 
-        # Check for error
-        if 'error' in result:
-            raise HTTPException(status_code=400, detail=result['error'])
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
 
-        # Calculate latency
         latency_ms = (time.perf_counter() - start_time) * 1000
 
         return KDPredictionResponse(
-            input_material=result['input_material'],
-            input_plant=result['input_plant'],
-            input_bf=result['input_bf'],
-            summary=result['summary'],
-            kd_outputs=result['kd_outputs'],
+            input_material=result["input_material"],
+            input_plant=result["input_plant"],
+            input_bf=result["input_bf"],
+            summary=result["summary"],
+            kd_outputs=result["kd_outputs"],
             latency_ms=round(latency_ms, 2),
-            model_version=model_version
+            model_version=model_year,
         )
 
     except HTTPException:
@@ -225,32 +283,82 @@ async def predict_kd(request: KDPredictionRequest):
 
 
 @app.get("/kd-materials", tags=["KD Prediction"])
-async def list_kd_materials():
+async def list_kd_materials(
+    model_year: str = Query("2024", description="Model year"),
+):
     """List available KS materials for KD prediction."""
-    if kd_service is None:
-        raise HTTPException(
-            status_code=503,
-            detail="KD Distribution service not available"
-        )
-
-    materials = kd_service.get_available_materials()
-    return {"materials": materials, "count": len(materials)}
+    kd = _get_model_or_raise(model_year, kd_services, "KD Distribution service")
+    materials = kd.get_available_materials()
+    return {"model_year": model_year, "materials": materials, "count": len(materials)}
 
 
 @app.get("/kd-plants/{material}", tags=["KD Prediction"])
-async def list_kd_plants(material: str):
+async def list_kd_plants(
+    material: str,
+    model_year: str = Query("2024", description="Model year"),
+):
     """List available plants for a specific KS material."""
-    if kd_service is None:
+    kd = _get_model_or_raise(model_year, kd_services, "KD Distribution service")
+
+    plants = kd.get_available_plants(material)
+    if not plants:
+        raise HTTPException(status_code=404, detail=f"Material not found: {material}")
+
+    return {"model_year": model_year, "material": material, "plants": plants, "count": len(plants)}
+
+
+# ============== Multi-Output Prediction ==============
+
+@app.post("/predict-multi-output", response_model=MultiOutputResponse, tags=["Multi-Output Prediction"])
+async def predict_multi_output(request: MultiOutputRequest):
+    """
+    Predict output board distribution from 261 consumption tally records.
+
+    Two-step XGBoost model:
+    1. Predicts yield factor (what fraction of input becomes output)
+    2. Predicts BIN distribution (how output splits across Grade/Length/Width)
+
+    Supports batch processing (up to 10,000 records).
+    Records are automatically grouped by MANUFACTURINGORDER.
+    """
+    start_time = time.perf_counter()
+
+    if mo_service is None:
         raise HTTPException(
             status_code=503,
-            detail="KD Distribution service not available"
+            detail="Multi-Output model not available. Ensure baseline_yield_model.joblib and training_template.joblib are in models/multi_output/",
         )
 
-    plants = kd_service.get_available_plants(material)
-    if not plants:
+    try:
+        records = [r.model_dump() for r in request.records]
+
+        loop = asyncio.get_event_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, mo_service.predict, records),
+            timeout=120.0,
+        )
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+
+        return MultiOutputResponse(
+            num_orders=result["num_orders"],
+            total_bfin=result["total_bfin"],
+            avg_yield_factor=result["avg_yield_factor"],
+            total_predicted_output=result["total_predicted_output"],
+            total_boards=result["total_boards"],
+            orders=result["orders"],
+            latency_ms=round(latency_ms, 2),
+            model_version="multi-output-v1",
+            records_received=result.get("records_received"),
+            records_processed=result.get("records_processed"),
+        )
+
+    except asyncio.TimeoutError:
         raise HTTPException(
-            status_code=404,
-            detail=f"Material not found: {material}"
+            status_code=504,
+            detail=f"Prediction timed out after 120s for {len(request.records)} records",
         )
-
-    return {"material": material, "plants": plants, "count": len(plants)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Multi-output prediction error: {str(e)}")

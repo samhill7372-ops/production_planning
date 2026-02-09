@@ -1,0 +1,15 @@
+# Reduce Docker build context size
+.git/
+.venv/
+.conda/
+__pycache__/
+*.py[cod]
+data/
+training/
+docs/
+notebooks/
+nul
+*.ipynb
+.vscode/
+.idea/
+.claude/

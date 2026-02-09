@@ -162,6 +162,10 @@ def load_raw_csv_data(years: List[str] = None) -> Tuple[pd.DataFrame, pd.DataFra
         df_261['BFIN'] = pd.to_numeric(df_261['BFIN'], errors='coerce').fillna(0)
     if 'MATERIALTHICKNESS' in df_261.columns:
         df_261['MATERIALTHICKNESS'] = pd.to_numeric(df_261['MATERIALTHICKNESS'], errors='coerce').fillna(0)
+    if 'TALLYLENGTH' in df_261.columns:
+        df_261['TALLYLENGTH'] = pd.to_numeric(df_261['TALLYLENGTH'], errors='coerce').fillna(0)
+    if 'TALLYWIDTH' in df_261.columns:
+        df_261['TALLYWIDTH'] = pd.to_numeric(df_261['TALLYWIDTH'], errors='coerce').fillna(0)
 
     # Minimal processing for 101
     df_101.columns = df_101.columns.str.upper().str.strip()
@@ -169,6 +173,10 @@ def load_raw_csv_data(years: List[str] = None) -> Tuple[pd.DataFrame, pd.DataFra
         df_101['MANUFACTURINGORDER'] = df_101['MANUFACTURINGORDER'].astype(str).str.strip()
     if 'BFOUT' in df_101.columns:
         df_101['BFOUT'] = pd.to_numeric(df_101['BFOUT'], errors='coerce').fillna(0)
+    if 'TALLYLENGTH' in df_101.columns:
+        df_101['TALLYLENGTH'] = pd.to_numeric(df_101['TALLYLENGTH'], errors='coerce').fillna(0)
+    if 'TALLYWIDTH' in df_101.columns:
+        df_101['TALLYWIDTH'] = pd.to_numeric(df_101['TALLYWIDTH'], errors='coerce').fillna(0)
 
     print(f"Loaded RAW 261: {len(df_261):,} rows, BFIN total: {df_261['BFIN'].sum():,.0f}")
     print(f"Loaded RAW 101: {len(df_101):,} rows, BFOUT total: {df_101['BFOUT'].sum():,.0f}")

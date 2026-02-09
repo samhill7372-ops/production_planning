@@ -1,0 +1,23 @@
+{
+  "trained_years": [
+    "2024",
+    "2025"
+  ],
+  "trained_at": "2026-02-05T16:54:54.436368",
+  "best_model": "GradientBoostingRegressor",
+  "test_r2": 0.03445008290838214,
+  "test_rmse": 15.833505340636428,
+  "test_mae": 10.711654048320135,
+  "num_features": 8,
+  "feature_columns": [
+    "Input_Material_Encoded",
+    "Input_Specie_Encoded",
+    "Input_Grade_Encoded",
+    "Input_Plant_Encoded",
+    "Input_Thickness",
+    "Input_Length",
+    "Input_Width",
+    "Total_Input_BF"
+  ],
+  "config_name": "yield-2year"
+}

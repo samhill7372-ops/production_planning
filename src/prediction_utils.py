@@ -257,6 +257,62 @@ def forward_predict(
     }
 
 
+def get_batch_forward_prediction(
+    materials_list: List[Dict[str, Any]],
+    df_261_raw: pd.DataFrame,
+    df_101_raw: pd.DataFrame,
+    model,
+    encoders: Dict,
+    feature_columns: List[str],
+    min_order_count: int = 5
+) -> List[Dict[str, Any]]:
+    """
+    Batch prediction with full KD breakdown for each material.
+    Calls get_advanced_forward_prediction() for each input material.
+
+    Args:
+        materials_list: List of dicts, each containing:
+            - plant: Plant code (e.g., '1Y01')
+            - material: Material code (e.g., '4PO3BKS')
+            - input_bf: Input board feet quantity
+        df_261_raw: Raw 261 CSV data (input materials)
+        df_101_raw: Raw 101 CSV data (output materials)
+        model: Trained sklearn model
+        encoders: LabelEncoders for categorical features
+        feature_columns: Feature columns used by model
+        min_order_count: Minimum historical orders to include KD material
+
+    Returns:
+        List of dicts with full prediction results including KD breakdown
+    """
+    results = []
+
+    for material_input in materials_list:
+        plant = material_input.get('plant', '1Y01')
+        material = material_input.get('material', '')
+        input_bf = float(material_input.get('input_bf', 0))
+
+        # Call the same function as single prediction to get full KD breakdown
+        result = get_advanced_forward_prediction(
+            ks_material=material,
+            plant=plant,
+            input_bf=input_bf,
+            df_261_raw=df_261_raw,
+            df_101_raw=df_101_raw,
+            model=model,
+            encoders=encoders,
+            feature_columns=feature_columns,
+            min_order_count=min_order_count
+        )
+
+        # Add input identifier for batch tracking
+        result['input_material'] = material
+        result['input_plant'] = plant
+        results.append(result)
+
+    return results
+
+
 def simulate_output_materials(
     model,
     input_materials: List[Dict[str, Any]],
