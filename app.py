@@ -3016,11 +3016,10 @@ def main():
         "Choose prediction type:",
         [
             "Advanced Forward Prediction",
-            "Batch Prediction",
             "Multi-Output Prediction"
         ],
         horizontal=True,
-        help="Advanced: Single material ML + statistical prediction. Batch: Multiple materials at once. Multi-Output: Upload CSV for detailed board-level output distribution."
+        help="Advanced: Single material ML + statistical prediction. Multi-Output: Upload CSV for detailed board-level output distribution."
     )
 
     st.markdown("---")
@@ -3043,11 +3042,6 @@ def main():
     if prediction_mode == "Advanced Forward Prediction":
         # Advanced Forward Prediction Section (ML + Statistical Hybrid)
         render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns, precomputed_data)
-        return  # Exit early for this mode
-
-    if prediction_mode == "Batch Prediction":
-        # Batch Prediction Section (Multiple Materials)
-        render_batch_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns, precomputed_data)
         return  # Exit early for this mode
 
     if prediction_mode == "Multi-Output Prediction":
