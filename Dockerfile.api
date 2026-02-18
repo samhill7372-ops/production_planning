@@ -23,6 +23,9 @@ COPY deployment/models/ /app/models/
 # Copy 2year model (Advanced Prediction) from root models/
 COPY models/2year/ /app/models/2year/
 
+# Copy KD ML distribution models (KNN + XGBoost, ~12MB)
+COPY models/kd_distribution/ /app/models/kd_distribution/
+
 # Copy multi_output models (XGBoost) — split parts reassembled here
 COPY models/multi_output/baseline_yield_model.part_* /app/models/multi_output/
 COPY models/multi_output/training_template.joblib /app/models/multi_output/

@@ -1,6 +1,9 @@
 # Data files (too large for GitHub)
 data/
 
+# Large model file (split parts are used instead)
+models/multi_output/baseline_yield_model.joblib
+
 # Python
 __pycache__/
 *.py[cod]

@@ -27,6 +27,8 @@ import joblib
 import os
 import sys
 from typing import Dict, Any, List, Optional
+import requests
+from datetime import datetime
 
 # Add src directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -194,18 +196,36 @@ def load_model_artifacts(model_year: str = None):
         classifier = None
         classifier_features = []
         classifier_metrics = {}
+        classifier_source = "missing"
 
         classifier_path = os.path.join(base_path, "output_classifier.joblib")
         if os.path.exists(classifier_path):
             classifier = joblib.load(classifier_path)
+            classifier_source = "selected_model"
+        else:
+            # Fallback: use root-level classifier if year folder doesn't have one
+            root_classifier_path = os.path.join(MODELS_DIR, "output_classifier.joblib")
+            if os.path.exists(root_classifier_path):
+                classifier = joblib.load(root_classifier_path)
+                classifier_source = "root_fallback"
 
         clf_features_path = os.path.join(base_path, "classifier_features.joblib")
         if os.path.exists(clf_features_path):
             classifier_features = joblib.load(clf_features_path)
+        else:
+            # Fallback: use root-level classifier features
+            root_clf_features_path = os.path.join(MODELS_DIR, "classifier_features.joblib")
+            if os.path.exists(root_clf_features_path):
+                classifier_features = joblib.load(root_clf_features_path)
 
         clf_metrics_path = os.path.join(base_path, "classifier_metrics.joblib")
         if os.path.exists(clf_metrics_path):
             classifier_metrics = joblib.load(clf_metrics_path)
+        else:
+            # Fallback: use root-level classifier metrics
+            root_clf_metrics_path = os.path.join(MODELS_DIR, "classifier_metrics.joblib")
+            if os.path.exists(root_clf_metrics_path):
+                classifier_metrics = joblib.load(root_clf_metrics_path)
 
         return {
             'model': model,
@@ -216,6 +236,7 @@ def load_model_artifacts(model_year: str = None):
             'classifier': classifier,
             'classifier_features': classifier_features,
             'classifier_metrics': classifier_metrics,
+            'classifier_source': classifier_source,
             'model_metadata': model_metadata
         }
     except Exception as e:
@@ -238,6 +259,28 @@ def load_multi_output_model():
         }
     except Exception as e:
         st.error(f"Error loading multi-output model: {e}")
+        return None
+
+
+@st.cache_resource
+def load_kd_distribution_model():
+    """Load the KD material distribution model and template."""
+    model_dir = os.path.join(MODELS_DIR, "kd_distribution")
+    bundle_path = os.path.join(model_dir, "kd_model_bundle.joblib")
+    template_path = os.path.join(model_dir, "kd_training_template.joblib")
+    history_path = os.path.join(model_dir, "kd_material_history.joblib")
+    if not os.path.exists(bundle_path) or not os.path.exists(template_path):
+        return None
+    try:
+        result = {
+            'model_bundle': joblib.load(bundle_path),
+            'template_df': joblib.load(template_path),
+        }
+        if os.path.exists(history_path):
+            result['material_history'] = joblib.load(history_path)
+        return result
+    except Exception as e:
+        st.error(f"Error loading KD distribution model: {e}")
         return None
 
 
@@ -334,6 +377,9 @@ def load_historical_data(selected_year: str = None):
 def load_dropdown_options():
     """Load options for dropdown menus from CSV files."""
     options = get_unique_materials_from_csv()
+    # Remove KD (output) materials from Input_Material dropdown
+    if options.get('Input_Material'):
+        options['Input_Material'] = [m for m in options['Input_Material'] if 'KD' not in m.upper()]
     # Debug: print counts
     for key, values in options.items():
         if values:
@@ -1770,6 +1816,795 @@ def render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, 
             #     ... (explanation content hidden)
 
 
+def get_historical_outputs_for_input(
+    ks_material: str,
+    plant: str,
+    df_261_raw: Optional[pd.DataFrame] = None,
+    df_101_raw: Optional[pd.DataFrame] = None,
+    precomputed_data: Optional[Dict[str, Any]] = None
+) -> List[str]:
+    """Get historically observed output materials for a KS material and plant."""
+    # Preferred path: raw order-level data
+    if df_261_raw is not None and df_101_raw is not None and len(df_261_raw) > 0 and len(df_101_raw) > 0:
+        filtered_261 = df_261_raw[
+            (df_261_raw['MATERIAL'] == ks_material) &
+            (df_261_raw['PLANT'] == plant)
+        ].copy()
+        if len(filtered_261) > 0:
+            order_list = filtered_261['MANUFACTURINGORDER'].unique()
+            filtered_101 = df_101_raw[df_101_raw['MANUFACTURINGORDER'].isin(order_list)].copy()
+            if len(filtered_101) > 0 and 'MATERIAL' in filtered_101.columns:
+                return sorted([str(x) for x in filtered_101['MATERIAL'].dropna().unique()])
+
+    # Fallback: precomputed KD distribution for KS+Plant
+    if precomputed_data is not None:
+        material_stats = precomputed_data.get('material_stats', {})
+        ks_data = material_stats.get(ks_material, {})
+        plant_data = ks_data.get(plant, {})
+        kd_dist = plant_data.get('kd_distribution', [])
+        if kd_dist:
+            return sorted([str(kd.get('KD_Material')) for kd in kd_dist if kd.get('KD_Material')])
+
+    return []
+
+
+def render_test2_ml_only_section(
+    options,
+    model,
+    classifier,
+    encoders,
+    feature_columns,
+    classifier_features,
+    classifier_source="missing",
+    df_261_raw=None,
+    df_101_raw=None,
+    precomputed_data=None,
+    kd_model_artifacts=None,
+):
+    """Render V2.1: ML-only KD material distribution prediction."""
+    from src.kd_material_prediction import predict_kd_distribution
+
+    use_kd_model = kd_model_artifacts is not None
+
+    st.subheader("V2.1: ML Output Material Distribution")
+    if use_kd_model:
+        st.caption("Material-Aware KNN + XGBoost: predicts yield and output material distribution from historical patterns")
+    else:
+        st.warning("KD distribution model not found. Using legacy classifier approach (less accurate).")
+
+    # --- Input Mode Toggle ---
+    input_mode = st.radio(
+        "Input Mode",
+        ["Manual Entry", "Upload 261 File"],
+        horizontal=True,
+        key="t2_input_mode",
+    )
+
+    limit_historical = True
+    exclude_other = False
+
+    if input_mode == "Manual Entry":
+        # ---- MANUAL ENTRY MODE ----
+        col1, col2 = st.columns(2)
+
+        with col1:
+            plant_options = options.get('Input_Plant', ['1M02', '1Y01'])
+            selected_plant = st.selectbox("Plant *", options=plant_options, key="t2_plant")
+
+            material_options = options.get('Input_Material', [])
+            mat_search = st.text_input(
+                "Search Material",
+                key="t2_mat_search",
+                placeholder="Type to filter..."
+            )
+            if mat_search:
+                filtered_materials = [m for m in material_options if mat_search.upper() in str(m).upper()]
+            else:
+                filtered_materials = material_options
+
+            selected_material = st.selectbox(
+                f"Material * ({len(filtered_materials)} available)",
+                options=filtered_materials if filtered_materials else ['No materials found'],
+                key="t2_material"
+            )
+
+            specie_options = options.get('Input_Specie', ['SM'])
+            selected_specie = st.selectbox("Specie *", options=specie_options, key="t2_specie")
+
+            grade_options = options.get('Input_Grade', ['2C'])
+            selected_grade = st.selectbox("Grade *", options=grade_options, key="t2_grade")
+
+        with col2:
+            input_bf = st.number_input(
+                "Input BF (BFIN) *",
+                min_value=0.0,
+                max_value=10000000.0,
+                value=10000.0,
+                step=1000.0,
+                key="t2_bfin"
+            )
+            input_thickness = st.number_input(
+                "Thickness *",
+                min_value=0.0,
+                max_value=100.0,
+                value=4.0,
+                step=0.1,
+                key="t2_thickness"
+            )
+            input_width = st.number_input(
+                "Width *",
+                min_value=0.0,
+                max_value=100.0,
+                value=8.0,
+                step=0.1,
+                key="t2_width"
+            )
+            limit_historical = st.checkbox(
+                "Limit to historically seen outputs for this input material",
+                value=True,
+                key="t2_hist_only"
+            )
+            if use_kd_model:
+                exclude_other = st.checkbox(
+                    "Redistribute 'Other' across named materials",
+                    value=False,
+                    key="t2_exclude_other",
+                    help="Removes the catch-all 'Other Materials' bucket and spreads its BF across the named KD materials."
+                )
+
+            # Legacy classifier controls
+            if not use_kd_model:
+                top_k = st.slider("Top related outputs", min_value=3, max_value=10, value=5, step=1, key="t2_top_k")
+                confidence_threshold_pct = st.slider(
+                    "Minimum top probability (%)",
+                    min_value=10, max_value=80, value=35, step=5, key="t2_conf_thr"
+                )
+                kd_only = st.checkbox("Show KD materials only", value=True, key="t2_kd_only")
+
+        st.markdown("---")
+
+        if st.button("Predict Output Distribution", type="primary", use_container_width=True, key="t2_run"):
+            if selected_material == 'No materials found':
+                st.error("Please select a valid material.")
+                return
+
+            input_data = {
+                'Input_Plant': selected_plant,
+                'Input_Material': selected_material,
+                'Input_Thickness': input_thickness,
+                'Input_Specie': selected_specie,
+                'Input_Grade': selected_grade,
+                'Input_Width': input_width,
+                'Total_Input_BF': input_bf,
+                'Input_Length': 96.0,
+            }
+
+            with st.spinner("Running ML prediction..."):
+                if use_kd_model:
+                    kd_bundle = kd_model_artifacts['model_bundle']
+                    kd_template = kd_model_artifacts['template_df']
+                    kd_cols = [c for c in kd_template.columns if c.startswith("KD_")]
+                    material_history = kd_model_artifacts.get('material_history')
+
+                    result_df, summary = predict_kd_distribution(
+                        input_data=input_data,
+                        model_bundle=kd_bundle,
+                        template_df=kd_template,
+                        kd_cols=kd_cols,
+                        material_history=material_history,
+                        apply_material_guardrail=limit_historical,
+                        exclude_other=exclude_other,
+                    )
+
+                    st.session_state.t2_result = {
+                        'mode': 'kd_distribution',
+                        'input_data': input_data,
+                        'result_df': result_df,
+                        'summary': summary,
+                    }
+                else:
+                    if model is None:
+                        st.error("Yield model not available.")
+                        return
+                    if classifier is None:
+                        st.error("Output classifier not available.")
+                        return
+
+                    yield_result = forward_predict(model, input_data, encoders, feature_columns)
+                    output_preds = predict_output_material(
+                        classifier=classifier,
+                        input_data=input_data,
+                        encoders=encoders,
+                        classifier_features=classifier_features,
+                        top_k=top_k
+                    )
+                    if kd_only:
+                        output_preds = [p for p in output_preds if 'KD' in str(p.get('output_material', '')).upper()]
+
+                    historical_outputs = get_historical_outputs_for_input(
+                        ks_material=selected_material,
+                        plant=selected_plant,
+                        df_261_raw=df_261_raw,
+                        df_101_raw=df_101_raw,
+                        precomputed_data=precomputed_data
+                    )
+                    if limit_historical and historical_outputs:
+                        historical_set = set(historical_outputs)
+                        output_preds = [p for p in output_preds if str(p.get('output_material', '')) in historical_set]
+
+                    total_output_bf = float(yield_result.get('predicted_output_bf', 0))
+                    total_prob = sum(p.get('probability', 0.0) for p in output_preds)
+                    norm_denominator = total_prob if total_prob > 0 else 1.0
+                    alloc_rows = []
+                    for p in output_preds:
+                        prob = float(p.get('probability', 0.0))
+                        alloc_rows.append({
+                            'Output Material': p.get('output_material'),
+                            'Distribution %': round(prob / norm_denominator * 100, 2),
+                            'Expected Output BF': round(total_output_bf * (prob / norm_denominator), 2),
+                        })
+                    result_df = pd.DataFrame(alloc_rows)
+                    summary = {
+                        'predicted_yield_pct': yield_result.get('predicted_yield_pct', 0),
+                        'predicted_output': total_output_bf,
+                        'kd_count': len(result_df),
+                        'total_bfin': input_bf,
+                        'yield_factor': yield_result.get('predicted_yield_pct', 0) / 100,
+                    }
+
+                    st.session_state.t2_result = {
+                        'mode': 'legacy',
+                        'input_data': input_data,
+                        'result_df': result_df,
+                        'summary': summary,
+                    }
+
+    else:
+        # ---- UPLOAD 261 FILE MODE ----
+        if not use_kd_model:
+            st.error("261 file upload requires the KD distribution model. Model not found.")
+            return
+
+        uploaded_file = st.file_uploader(
+            "Upload your 261 (Goods Issue) CSV file:",
+            type=["csv"],
+            key="t2_file_upload",
+            help="CSV should contain 261 consumption records with columns: MANUFACTURINGORDER, MATERIAL, BFIN, MATERIALSPECIE, MATERIALTHICKNESS, PLANT, TALLYGRADE, TALLYWIDTH"
+        )
+
+        if uploaded_file is not None:
+            df_upload = pd.read_csv(uploaded_file)
+            df_upload.columns = df_upload.columns.str.upper().str.strip()
+
+            # Filter to 261 movement type if column exists
+            if "GOODSMOVEMENTTYPE" in df_upload.columns:
+                df_upload = df_upload[df_upload["GOODSMOVEMENTTYPE"].astype(str) == "261"].copy()
+
+            # Validate required columns
+            required_cols = ["MANUFACTURINGORDER", "MATERIAL", "BFIN"]
+            recommended_cols = ["MATERIALSPECIE", "MATERIALTHICKNESS", "PLANT", "TALLYGRADE", "TALLYWIDTH"]
+
+            missing_required = [c for c in required_cols if c not in df_upload.columns]
+            missing_recommended = [c for c in recommended_cols if c not in df_upload.columns]
+
+            if missing_required:
+                st.error(f"Missing required columns: {', '.join(missing_required)}")
+                return
+
+            if missing_recommended:
+                st.warning(f"Missing optional columns (predictions may be less accurate): {', '.join(missing_recommended)}")
+
+            # Ensure numeric types
+            df_upload["BFIN"] = pd.to_numeric(df_upload["BFIN"], errors="coerce").fillna(0)
+
+            # Aggregate per manufacturing order
+            order_agg = df_upload.groupby("MANUFACTURINGORDER").agg(
+                Material=("MATERIAL", "first"),
+                Total_BFIN=("BFIN", "sum"),
+                Rows=("BFIN", "count"),
+                Specie=("MATERIALSPECIE", "first") if "MATERIALSPECIE" in df_upload.columns else ("MATERIAL", lambda x: ""),
+                Thickness=("MATERIALTHICKNESS", "first") if "MATERIALTHICKNESS" in df_upload.columns else ("MATERIAL", lambda x: 0),
+                Plant=("PLANT", "first") if "PLANT" in df_upload.columns else ("MATERIAL", lambda x: ""),
+                Grade=("TALLYGRADE", "first") if "TALLYGRADE" in df_upload.columns else ("MATERIAL", lambda x: ""),
+                Width=("TALLYWIDTH", "max") if "TALLYWIDTH" in df_upload.columns else ("MATERIAL", lambda x: 0),
+            ).reset_index()
+
+            st.success(f"Loaded **{len(df_upload):,}** rows with **{len(order_agg)}** manufacturing orders")
+
+            # Preview table
+            preview_df = order_agg[["MANUFACTURINGORDER", "Material", "Total_BFIN", "Rows"]].copy()
+            preview_df.columns = ["Order", "Input Material", "Total Input BF", "Rows"]
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+            # Options
+            col_opt1, col_opt2 = st.columns(2)
+            with col_opt1:
+                limit_historical = st.checkbox(
+                    "Limit to historically seen outputs",
+                    value=True,
+                    key="t2_upload_hist_only"
+                )
+            with col_opt2:
+                exclude_other = st.checkbox(
+                    "Redistribute 'Other' across named materials",
+                    value=False,
+                    key="t2_upload_exclude_other",
+                )
+
+            st.markdown("---")
+
+            if st.button("Predict All Orders", type="primary", use_container_width=True, key="t2_upload_run"):
+                kd_bundle = kd_model_artifacts['model_bundle']
+                kd_template = kd_model_artifacts['template_df']
+                kd_cols = [c for c in kd_template.columns if c.startswith("KD_")]
+                material_history = kd_model_artifacts.get('material_history')
+
+                all_results = []
+                all_summaries = []
+                progress_bar = st.progress(0)
+
+                for i, row in order_agg.iterrows():
+                    order_id = row["MANUFACTURINGORDER"]
+                    input_data = {
+                        'Input_Plant': str(row.get("Plant", "")),
+                        'Input_Material': str(row["Material"]),
+                        'Input_Thickness': float(row.get("Thickness", 0)) if pd.notna(row.get("Thickness")) else 0.0,
+                        'Input_Specie': str(row.get("Specie", "")),
+                        'Input_Grade': str(row.get("Grade", "")),
+                        'Input_Width': float(row.get("Width", 0)) if pd.notna(row.get("Width")) else 0.0,
+                        'Total_Input_BF': float(row["Total_BFIN"]),
+                        'Input_Length': 96.0,
+                    }
+
+                    # Get full 261 rows for this order (all lengths/widths/grades)
+                    order_rows = df_upload[df_upload["MANUFACTURINGORDER"] == order_id]
+
+                    try:
+                        result_df, summary = predict_kd_distribution(
+                            input_data=input_data,
+                            model_bundle=kd_bundle,
+                            template_df=kd_template,
+                            kd_cols=kd_cols,
+                            material_history=material_history,
+                            apply_material_guardrail=limit_historical,
+                            exclude_other=exclude_other,
+                            df_261_rows=order_rows,
+                        )
+                        result_df.insert(0, "Order", order_id)
+                        result_df.insert(1, "Input Material", str(row["Material"]))
+                        all_results.append(result_df)
+                        all_summaries.append({
+                            'order': order_id,
+                            'input_material': str(row["Material"]),
+                            **summary,
+                        })
+                    except Exception as e:
+                        st.warning(f"Order {order_id}: prediction failed - {e}")
+
+                    progress_bar.progress((i + 1) / len(order_agg))
+
+                progress_bar.empty()
+
+                if all_results:
+                    combined_df = pd.concat(all_results, ignore_index=True)
+                    summary_df = pd.DataFrame(all_summaries)
+
+                    # Store in session state for display
+                    st.session_state.t2_result = {
+                        'mode': 'kd_distribution_batch',
+                        'input_data': {'Input_Material': 'Batch Upload', 'Input_Plant': 'Multiple'},
+                        'result_df': combined_df,
+                        'summary': {
+                            'predicted_yield_pct': round(summary_df['predicted_yield_pct'].mean(), 2),
+                            'predicted_output': round(summary_df['predicted_output'].sum(), 2),
+                            'kd_count': combined_df['Output Material'].nunique() if 'Output Material' in combined_df.columns else 0,
+                            'total_bfin': round(summary_df['total_bfin'].sum(), 2),
+                            'n_orders': len(summary_df),
+                        },
+                        'summary_df': summary_df,
+                    }
+                else:
+                    st.error("No predictions could be generated.")
+
+    # --- Display results ---
+    if st.session_state.get('t2_result'):
+        result = st.session_state['t2_result']
+        input_data = result['input_data']
+        result_df = result['result_df']
+        summary = result['summary']
+        is_batch = result.get('mode') == 'kd_distribution_batch'
+
+        st.markdown("---")
+        st.header("Prediction Results")
+
+        if result.get('mode') in ('kd_distribution', 'kd_distribution_batch'):
+            if is_batch:
+                n_orders = summary.get('n_orders', 0)
+                st.info(f"Prediction Method: Material-Aware KNN + XGBoost Yield | **{n_orders} orders** processed")
+            else:
+                search_mode = summary.get('search_mode', 'unknown')
+                n_nbrs = summary.get('n_neighbors_used', '?')
+                avg_dist = summary.get('avg_neighbor_distance', '?')
+                st.info(
+                    f"Prediction Method: Material-Aware KNN + XGBoost Yield  \n"
+                    f"Search: **{search_mode}** | Neighbors: **{n_nbrs}** | Avg distance: **{avg_dist}**"
+                )
+        else:
+            st.warning("Prediction Method: Legacy Classifier (probabilities are confidence scores, not production proportions)")
+
+        st.caption(
+            "Finds the most similar historical orders for this input material and averages their actual output distributions."
+        )
+
+        if is_batch:
+            col_a, col_b, col_c, col_d = st.columns(4)
+        else:
+            col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            label = "Avg Yield %" if is_batch else "Overall Yield %"
+            st.metric(label, f"{summary.get('predicted_yield_pct', 0):.1f}%")
+        with col_b:
+            st.metric("Total Expected Output BF", f"{summary.get('predicted_output', 0):,.0f}")
+        with col_c:
+            st.metric("Output Materials Found", f"{summary.get('kd_count', 0)}")
+        if is_batch:
+            with col_d:
+                st.metric("Orders Processed", f"{summary.get('n_orders', 0)}")
+
+        if result_df is None or result_df.empty:
+            st.warning("No output materials predicted for this input combination.")
+            return
+
+        # Batch: show per-order summary table first
+        if is_batch and 'summary_df' in result:
+            st.subheader("Per-Order Summary")
+            sum_df = result['summary_df'][['order', 'input_material', 'total_bfin', 'predicted_yield_pct', 'predicted_output', 'kd_count']].copy()
+            sum_df.columns = ['Order', 'Input Material', 'Input BF', 'Yield %', 'Expected Output BF', 'Output Materials']
+            st.dataframe(sum_df, use_container_width=True, hide_index=True)
+
+        st.subheader("Output Material Distribution")
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+        # Export
+        export_df = result_df.copy()
+        if not is_batch:
+            export_df['Input Material'] = input_data.get('Input_Material')
+            export_df['Plant'] = input_data.get('Input_Plant')
+            export_df['Input Thickness'] = input_data.get('Input_Thickness')
+            export_df['Input Width'] = input_data.get('Input_Width')
+            export_df['Input Specie'] = input_data.get('Input_Specie')
+            export_df['Input Grade'] = input_data.get('Input_Grade')
+        export_df['Overall Yield %'] = summary.get('predicted_yield_pct', 0)
+        export_df['Total Expected Output BF'] = summary.get('predicted_output', 0)
+
+        csv = export_df.to_csv(index=False)
+        file_label = "batch" if is_batch else input_data.get('Input_Material', 'material')
+        st.download_button(
+            label="Download Results (CSV)",
+            data=csv,
+            file_name=f"kd_distribution_{file_label}.csv",
+            mime="text/csv",
+            key="t2_download"
+        )
+
+
+def render_final_v2_section():
+    """Render the V2.2 section - External API prediction with configurable options."""
+    st.subheader("V2.2: External API Prediction")
+    st.caption("Upload 261 consumption data and call external API for material distribution predictions")
+
+    API_ENDPOINT = "https://predictkd-production.up.railway.app/predict"
+
+    # --- Step 1: File Upload ---
+    uploaded_file = st.file_uploader(
+        "Upload your 261 (Goods Issue) CSV file:",
+        type=["csv"],
+        key="fv2_file_upload",
+        help="CSV should contain 261 consumption records with columns: MANUFACTURINGORDER, MATERIAL, BFIN, MATERIALSPECIE, MATERIALTHICKNESS, PLANT, TALLYGRADE, TALLYLENGTH, TALLYWIDTH"
+    )
+
+    if uploaded_file is None:
+        st.info("Please upload a CSV file to continue.")
+        return
+
+    try:
+        df_upload = pd.read_csv(uploaded_file)
+        df_upload.columns = df_upload.columns.str.upper().str.strip()
+    except Exception as e:
+        st.error(f"Error reading CSV file: {e}")
+        return
+
+    # Filter to 261 movement type if column exists
+    if "GOODSMOVEMENTTYPE" in df_upload.columns:
+        original_count = len(df_upload)
+        df_upload = df_upload[df_upload["GOODSMOVEMENTTYPE"].astype(str) == "261"].copy()
+        if len(df_upload) < original_count:
+            st.info(f"Filtered to {len(df_upload):,} rows with GOODSMOVEMENTTYPE=261 (from {original_count:,} total)")
+
+    # Validate required columns
+    required_cols = [
+        "MANUFACTURINGORDER", "MATERIAL", "BFIN", "MATERIALSPECIE",
+        "MATERIALTHICKNESS", "PLANT", "TALLYGRADE", "TALLYLENGTH", "TALLYWIDTH"
+    ]
+    missing_cols = [col for col in required_cols if col not in df_upload.columns]
+
+    if missing_cols:
+        st.error(f"Missing required columns: {', '.join(missing_cols)}")
+        st.caption(f"Available columns: {', '.join(df_upload.columns.tolist())}")
+        return
+
+    # Ensure numeric types
+    df_upload["BFIN"] = pd.to_numeric(df_upload["BFIN"], errors="coerce").fillna(0)
+    df_upload["MATERIALTHICKNESS"] = pd.to_numeric(df_upload["MATERIALTHICKNESS"], errors="coerce").fillna(0)
+    df_upload["TALLYLENGTH"] = pd.to_numeric(df_upload["TALLYLENGTH"], errors="coerce").fillna(0)
+    df_upload["TALLYWIDTH"] = pd.to_numeric(df_upload["TALLYWIDTH"], errors="coerce").fillna(0)
+
+    # Show data preview
+    unique_orders = df_upload["MANUFACTURINGORDER"].nunique()
+    unique_materials = df_upload["MATERIAL"].nunique()
+    total_bfin = df_upload["BFIN"].sum()
+
+    st.success(f"Loaded **{len(df_upload):,}** rows | **{unique_orders}** orders | **{unique_materials}** unique materials | Total BFIN: **{total_bfin:,.0f}**")
+    st.dataframe(df_upload.head(10), use_container_width=True, hide_index=True)
+
+    # --- Step 2: Output Level Selection ---
+    st.markdown("---")
+    output_level_option = st.radio(
+        "Select output level:",
+        ["Material", "Detailed"],
+        horizontal=True,
+        key="fv2_output_level",
+        help="Material: Material-level aggregation. Detailed: Board-level detail."
+    )
+
+    output_level_value = "detailed" if output_level_option == "Detailed" else "material"
+
+    # Exclude materials — populated from API response (shown after first API call)
+    exclude_materials = st.session_state.get('fv2_exclude_selection', [])
+
+    # --- Step 3: Configurable Options ---
+    st.markdown("---")
+    top_n = st.number_input(
+        "Top N Results",
+        min_value=1,
+        max_value=100,
+        value=15,
+        step=1,
+        key="fv2_top_n",
+        help="Number of top results to return from API"
+    )
+
+    # --- Step 4: API Call ---
+    st.markdown("---")
+    if st.button("Call External API", type="primary", use_container_width=True, key="fv2_predict_btn"):
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # Build inputs array from CSV rows
+        inputs = []
+        for _, row in df_upload.iterrows():
+            inputs.append({
+                "material": str(row["MATERIAL"]),
+                "species": str(row["MATERIALSPECIE"]),
+                "thickness": float(row["MATERIALTHICKNESS"]),
+                "plant": str(row["PLANT"]),
+                "tallygrade": str(row["TALLYGRADE"]),
+                "tallylength": float(row["TALLYLENGTH"]),
+                "tallywidth": float(row["TALLYWIDTH"]),
+                "bfin": float(row["BFIN"]),
+                "posting_date": today,
+                "manufacturing_order": str(row["MANUFACTURINGORDER"])
+            })
+
+        # Build options object
+        api_options = {
+            "output_level": output_level_value,
+            "exclude_materials": exclude_materials,
+            "top_n": int(top_n)
+        }
+
+        request_body = {
+            "inputs": inputs,
+            "options": api_options
+        }
+
+        st.caption(f"Sending {len(inputs)} input rows | Output level: {output_level_value} | Top N: {top_n}")
+
+        progress_bar = st.progress(0, text="Sending request to API...")
+
+        try:
+            response = requests.post(
+                API_ENDPOINT,
+                json=request_body,
+                timeout=300,
+                headers={"Content-Type": "application/json"}
+            )
+            progress_bar.progress(50, text="Processing API response...")
+
+            if response.status_code == 200:
+                api_response = response.json()
+                progress_bar.progress(100, text="Success!")
+                progress_bar.empty()
+
+                st.session_state.fv2_response = api_response
+                st.session_state.fv2_inputs = inputs  # Store for re-call with exclusions
+                st.session_state.fv2_request_info = {
+                    "rows": len(inputs),
+                    "output_level": output_level_value,
+                    "top_n": top_n,
+                    "exclude_count": len(exclude_materials),
+                    "timestamp": today
+                }
+
+                # Extract KD materials from response for exclude dropdown
+                kd_materials_from_response = set()
+                try:
+                    # Parse response into a temp DataFrame to find KD material values
+                    temp_df = None
+                    if isinstance(api_response, dict):
+                        for key in ('predictions', 'results', 'data'):
+                            if key in api_response and isinstance(api_response[key], list):
+                                temp_df = pd.DataFrame(api_response[key])
+                                # Check nested distribution arrays
+                                for item in api_response[key]:
+                                    if isinstance(item, dict):
+                                        for dist in item.get('distribution', []):
+                                            if 'output_material' in dist:
+                                                kd_materials_from_response.add(str(dist['output_material']))
+                                        if 'output_material' in item:
+                                            kd_materials_from_response.add(str(item['output_material']))
+                                break
+                    elif isinstance(api_response, list):
+                        temp_df = pd.DataFrame(api_response)
+
+                    # Also check DataFrame columns for KD material values
+                    if temp_df is not None and not temp_df.empty:
+                        for col in ['output_material', 'material', 'kd_material', 'MATERIAL', 'OUTPUT_MATERIAL']:
+                            if col in temp_df.columns:
+                                vals = temp_df[col].dropna().astype(str).unique()
+                                kd_vals = [v for v in vals if 'KD' in v.upper()]
+                                kd_materials_from_response.update(kd_vals)
+                except Exception:
+                    pass
+                st.session_state.fv2_kd_materials = sorted(kd_materials_from_response)
+
+                st.success("API call successful!")
+            else:
+                progress_bar.empty()
+                st.error(f"API returned status {response.status_code}: {response.text}")
+
+        except requests.exceptions.Timeout:
+            progress_bar.empty()
+            st.error("API request timed out (5 minute limit). The server may be processing a large request.")
+        except requests.exceptions.ConnectionError:
+            progress_bar.empty()
+            st.error(f"Connection error. Unable to reach: {API_ENDPOINT}")
+        except requests.exceptions.RequestException as e:
+            progress_bar.empty()
+            st.error(f"Request error: {str(e)}")
+
+    # --- Step 5: Display Results ---
+    if st.session_state.get('fv2_response') is not None:
+        api_response = st.session_state.fv2_response
+        request_info = st.session_state.get('fv2_request_info', {})
+
+        st.markdown("---")
+        st.header("Prediction Results")
+        st.caption(
+            f"Rows: {request_info.get('rows', 'N/A')} | "
+            f"Output level: {request_info.get('output_level', 'N/A')} | "
+            f"Top N: {request_info.get('top_n', 'N/A')} | "
+            f"Excluded: {request_info.get('exclude_count', 0)}"
+        )
+
+        # Parse response into DataFrame
+        result_df = None
+        if isinstance(api_response, dict):
+            for key in ('predictions', 'results', 'data'):
+                if key in api_response:
+                    result_df = pd.DataFrame(api_response[key])
+                    break
+            if result_df is None:
+                result_df = pd.DataFrame([api_response])
+        elif isinstance(api_response, list):
+            result_df = pd.DataFrame(api_response)
+
+        if result_df is not None and not result_df.empty:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Results", f"{len(result_df):,}")
+            with col2:
+                st.metric("Input Rows Sent", f"{request_info.get('rows', 0):,}")
+            with col3:
+                st.metric("Request Date", request_info.get('timestamp', 'N/A'))
+
+            st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+            # --- Exclude Materials Dropdown (populated from API response) ---
+            # Extract KD materials directly from the result DataFrame
+            kd_materials_available = []
+            if 'material' in result_df.columns:
+                kd_materials_available = sorted(result_df['material'].dropna().astype(str).unique().tolist())
+            elif 'output_material' in result_df.columns:
+                kd_materials_available = sorted(result_df['output_material'].dropna().astype(str).unique().tolist())
+
+            if kd_materials_available:
+                st.markdown("---")
+                st.subheader("Exclude KD Materials")
+                exclude_selection = st.multiselect(
+                    "Select KD materials to exclude, then click 'Call External API' again:",
+                    options=kd_materials_available,
+                    default=[],
+                    key="fv2_exclude_materials",
+                    help="These KD output materials will be excluded from the next API call."
+                )
+                st.session_state.fv2_exclude_selection = exclude_selection
+                if exclude_selection:
+                    st.info(f"Excluding {len(exclude_selection)} material(s): {', '.join(exclude_selection)}")
+
+                    # Re-call API with exclusions button
+                    if st.button("Re-call API with Exclusions", type="primary", use_container_width=True, key="fv2_exclude_btn"):
+                        stored_inputs = st.session_state.get('fv2_inputs', [])
+                        if stored_inputs:
+                            re_request_info = st.session_state.get('fv2_request_info', {})
+                            api_options = {
+                                "output_level": re_request_info.get('output_level', 'material'),
+                                "exclude_materials": exclude_selection,
+                                "top_n": int(re_request_info.get('top_n', 15))
+                            }
+                            request_body = {
+                                "inputs": stored_inputs,
+                                "options": api_options
+                            }
+
+                            exclude_progress = st.progress(0, text="Re-calling API with exclusions...")
+                            try:
+                                re_response = requests.post(
+                                    "https://predictkd-production.up.railway.app/predict",
+                                    json=request_body,
+                                    timeout=300,
+                                    headers={"Content-Type": "application/json"}
+                                )
+                                exclude_progress.progress(50, text="Processing response...")
+
+                                if re_response.status_code == 200:
+                                    new_response = re_response.json()
+                                    exclude_progress.progress(100, text="Success!")
+                                    exclude_progress.empty()
+
+                                    st.session_state.fv2_response = new_response
+                                    st.session_state.fv2_request_info = {
+                                        "rows": len(stored_inputs),
+                                        "output_level": re_request_info.get('output_level', 'material'),
+                                        "top_n": re_request_info.get('top_n', 15),
+                                        "exclude_count": len(exclude_selection),
+                                        "timestamp": re_request_info.get('timestamp', '')
+                                    }
+                                    st.rerun()
+                                else:
+                                    exclude_progress.empty()
+                                    st.error(f"API returned status {re_response.status_code}: {re_response.text}")
+                            except Exception as e:
+                                exclude_progress.empty()
+                                st.error(f"Request error: {str(e)}")
+                        else:
+                            st.warning("No stored input data. Please call the API first using the button above.")
+
+            csv_output = result_df.to_csv(index=False)
+            st.download_button(
+                label="Download Results as CSV",
+                data=csv_output,
+                file_name=f"final_v2_predictions_{request_info.get('timestamp', 'export')}.csv",
+                mime="text/csv",
+                key="fv2_download",
+                use_container_width=True
+            )
+        else:
+            st.warning("No prediction results to display.")
+
+        with st.expander("View Raw API Response"):
+            st.json(api_response)
+
+
 def render_kd_material_lookup_section(options, historical_data, df_261_raw=None, df_101_raw=None, precomputed_data=None):
     """Render the KD Material Lookup section - find historical KD outputs for a KS input.
 
@@ -2891,105 +3726,18 @@ def main():
     # Get available pre-trained model years
     available_model_years = get_available_model_years()
 
-    # Sidebar
-    with st.sidebar:
-        # =====================================================================
-        # MODEL SELECTION SECTION
-        # =====================================================================
-        if available_model_years:
-            st.header("Model Selection")
-            # Create display options mapping
-            display_options = {get_model_display_name(m): m for m in available_model_years}
-            display_names = list(display_options.keys())
-
-            # Default to 2025 if available, otherwise last option
-            default_index = len(display_names) - 1
-            for i, model_id in enumerate(available_model_years):
-                if model_id == '2025':
-                    default_index = i
-                    break
-
-            selected_display = st.selectbox(
-                "Select prediction model:",
-                options=display_names,
-                index=default_index,  # Default to 2025
-                help="Choose which trained model to use for predictions"
-            )
-            selected_model_year = display_options[selected_display]
-            st.markdown("---")
-        else:
-            selected_model_year = None
+    # Auto-select model (sidebar model selection hidden)
+    if available_model_years:
+        selected_model_year = '2025' if '2025' in available_model_years else available_model_years[-1]
+    else:
+        selected_model_year = None
 
     # Load artifacts for selected model year
     artifacts = load_model_artifacts(selected_model_year)
     # Load historical data for the selected year (also returns raw 261/101 data for KD lookup)
     historical_data, df_261_raw, df_101_raw, precomputed_data = load_historical_data(selected_model_year)
 
-    # Continue sidebar content
-    with st.sidebar:
-        # =====================================================================
-        # CURRENT MODEL INFO SECTION
-        # =====================================================================
-        st.header("Current Model")
-
-        if artifacts:
-            # Show which model year is selected
-            if selected_model_year:
-                display_name = get_model_display_name(selected_model_year)
-                st.success(f"Using: {display_name}")
-            else:
-                st.success("Model Loaded")
-
-            # Show training years from metadata
-            model_metadata = artifacts.get('model_metadata', {})
-            trained_years = model_metadata.get('trained_years', [])
-            if trained_years:
-                st.info(f"Trained on: {', '.join(trained_years)}")
-
-            # Show trained timestamp
-            trained_at = model_metadata.get('trained_at', '')
-            if trained_at:
-                # Format the timestamp nicely
-                try:
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(trained_at)
-                    st.caption(f"Trained: {dt.strftime('%Y-%m-%d %H:%M')}")
-                except:
-                    pass
-
-            # Model metrics section hidden
-            # if artifacts['metrics']:
-            #     best_r2 = max(
-            #         m.get('test_r2', m.get('R2', 0))
-            #         for m in artifacts['metrics'].values()
-            #         if isinstance(m, dict)
-            #     )
-            #     st.metric("Model R² Score", f"{best_r2:.4f}")
-
-            # Classifier info section hidden
-            # if artifacts.get('classifier') is not None:
-            #     st.success("Output Classifier Loaded")
-            #     classifier_metrics = artifacts.get('classifier_metrics', {})
-            #     if classifier_metrics:
-            #         best_acc = max(
-            #             m.get('accuracy', 0)
-            #             for m in classifier_metrics.values()
-            #             if isinstance(m, dict)
-            #         )
-            #         st.metric("Classifier Accuracy", f"{best_acc:.2%}")
-            # else:
-            #     st.warning("Output Classifier not trained")
-        else:
-            st.warning("No model found for selected year")
-            st.caption("Please select a different year or ensure model files exist")
-
-        st.markdown("---")
-        st.markdown("""
-        **SAP Logic:**
-        - 261 = Goods Issue = Input (raw materials consumed)
-        - 101 = Goods Receipt = Output (finished goods produced)
-        - Yield = Output (101) / Input (261)
-        """)
+    # Sidebar model info hidden — using auto-selected model
 
     # Check if model is loaded
     if artifacts is None:
@@ -3006,6 +3754,9 @@ def main():
     feature_columns = artifacts['feature_columns']
     metrics = artifacts['metrics']
     test_results = artifacts['test_results']
+    classifier = artifacts.get('classifier')
+    classifier_features = artifacts.get('classifier_features', [])
+    classifier_source = artifacts.get('classifier_source', 'missing')
 
     # Load dropdown options for reverse prediction
     options = load_dropdown_options()
@@ -3015,11 +3766,13 @@ def main():
     prediction_mode = st.radio(
         "Choose prediction type:",
         [
-            "Advanced Forward Prediction",
-            "Multi-Output Prediction"
+            "V2.1",
+            "V2.2",
+            "Advanced Forward Prediction (Deprecated)",
+            "Multi-Output Prediction (Deprecated)"
         ],
         horizontal=True,
-        help="Advanced: Single material ML + statistical prediction. Multi-Output: Upload CSV for detailed board-level output distribution."
+        help="V2.1: ML-only yield + ML output materials. V2.2: External API prediction with customizable options. Advanced (Deprecated): ML + statistical KD distribution. Multi-Output (Deprecated): Upload CSV for board-level output distribution."
     )
 
     st.markdown("---")
@@ -3039,14 +3792,37 @@ def main():
         render_material_level_forward_prediction_section(options, df_261_raw, df_101_raw, precomputed_data)
         return  # Exit early for this mode
 
-    if prediction_mode == "Advanced Forward Prediction":
+    if prediction_mode == "Advanced Forward Prediction (Deprecated)":
         # Advanced Forward Prediction Section (ML + Statistical Hybrid)
         render_advanced_forward_prediction_section(options, df_261_raw, df_101_raw, model, encoders, feature_columns, precomputed_data)
         return  # Exit early for this mode
 
-    if prediction_mode == "Multi-Output Prediction":
+    if prediction_mode == "V2.1":
+        # V2.1 Section (ML-only KD material distribution)
+        kd_artifacts = load_kd_distribution_model()
+        render_test2_ml_only_section(
+            options=options,
+            model=model,
+            classifier=classifier,
+            encoders=encoders,
+            feature_columns=feature_columns,
+            classifier_features=classifier_features,
+            classifier_source=classifier_source,
+            df_261_raw=df_261_raw,
+            df_101_raw=df_101_raw,
+            precomputed_data=precomputed_data,
+            kd_model_artifacts=kd_artifacts,
+        )
+        return  # Exit early for this mode
+
+    if prediction_mode == "Multi-Output Prediction (Deprecated)":
         # Multi-Output Prediction Section (CSV Upload + Board Distribution)
         render_multi_output_prediction_section()
+        return  # Exit early for this mode
+
+    if prediction_mode == "V2.2":
+        # V2.2 Section (External API prediction)
+        render_final_v2_section()
         return  # Exit early for this mode
 
     if prediction_mode == "Reverse Prediction (Output -> Input)":

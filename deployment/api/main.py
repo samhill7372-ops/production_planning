@@ -10,12 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from schemas import (
     PredictionRequest, PredictionResponse, HealthResponse, ErrorResponse,
     KDPredictionRequest, KDPredictionResponse,
-    MultiOutputRequest, MultiOutputResponse
+    MultiOutputRequest, MultiOutputResponse,
+    KDMLPredictionRequest, KDMLPredictionResponse,
 )
 from inference import ONNXModelService
 from preprocessing import Preprocessor
 from kd_service import KDDistributionService
 from multi_output_service import MultiOutputService
+from kd_ml_service import KDMLDistributionService
 
 # ─── Global state (loaded once at startup) ────────────────────────────
 # One entry per model year: {"2024": ..., "2025": ..., "2year": ...}
@@ -26,6 +28,9 @@ available_models: list = []
 
 # Multi-output is a single model (not year-specific)
 mo_service: MultiOutputService = None
+
+# KD ML distribution model (KNN + XGBoost, not year-specific)
+kd_ml_service: KDMLDistributionService = None
 
 # Model years to attempt loading
 MODEL_YEARS = ["2024", "2025", "2year"]
@@ -40,11 +45,16 @@ def _resolve_model_dir(model_folder: str) -> str | None:
     docker_path = f"/app/models/{model_folder}"
     if os.path.exists(docker_path):
         return docker_path
-    # Local development path
+    # Local development path (deployment/models/)
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     local_path = os.path.join(base_dir, "models", model_folder)
     if os.path.exists(local_path):
         return local_path
+    # Project root models/ directory (for models not copied to deployment/)
+    project_root = os.path.dirname(base_dir)
+    root_path = os.path.join(project_root, "models", model_folder)
+    if os.path.exists(root_path):
+        return root_path
     return None
 
 
@@ -66,7 +76,7 @@ def _get_model_or_raise(model_year: str, service_dict: dict, service_name: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load ALL model years and multi-output model at startup."""
-    global mo_service
+    global mo_service, kd_ml_service
 
     # Load each year model
     for year in MODEL_YEARS:
@@ -112,6 +122,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Warning: Multi-Output model failed to load — {e}")
         mo_service = None
+
+    # Load KD ML Distribution model (KNN + XGBoost)
+    try:
+        kd_ml_dir = _resolve_model_dir("kd_distribution")
+        if kd_ml_dir and os.path.exists(os.path.join(kd_ml_dir, "kd_model_bundle.joblib")):
+            kd_ml_service = KDMLDistributionService(kd_ml_dir)
+            print(f"KD ML Distribution model loaded ({len(kd_ml_service.kd_cols)} KD categories)")
+        else:
+            print("Warning: KD ML model not found, /predict-kd-ml will be unavailable")
+    except Exception as e:
+        print(f"Warning: KD ML model failed to load — {e}")
+        kd_ml_service = None
 
     yield  # App runs here
     print("Shutting down...")
@@ -199,6 +221,7 @@ async def root():
         "version": "2.0.0",
         "available_models": available_models,
         "multi_output_available": mo_service is not None,
+        "kd_ml_available": kd_ml_service is not None,
         "docs": "/docs",
         "health": "/health",
     }
@@ -362,3 +385,57 @@ async def predict_multi_output(request: MultiOutputRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Multi-output prediction error: {str(e)}")
+
+
+# ============== KD ML Distribution Prediction ==============
+
+@app.post("/predict-kd-ml", response_model=KDMLPredictionResponse, tags=["KD ML Prediction"])
+async def predict_kd_ml(request: KDMLPredictionRequest):
+    """
+    Predict KD material distribution using ML model (KNN + XGBoost).
+
+    Accepts bulk tally records. Records are **grouped by manufacturing_order**
+    and all rows in the same order are processed together (matching how the
+    Streamlit CSV upload works).
+
+    Each order produces one prediction result with the full KD distribution.
+    """
+    start_time = time.perf_counter()
+
+    if kd_ml_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="KD ML model not available. Ensure kd_model_bundle.joblib, kd_training_template.joblib, and kd_material_history.joblib are in models/kd_distribution/",
+        )
+
+    try:
+        items = [item.model_dump() for item in request.items]
+
+        loop = asyncio.get_event_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, kd_ml_service.predict, items),
+            timeout=120.0,
+        )
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+
+        return KDMLPredictionResponse(
+            results=result["results"],
+            num_orders=result["num_orders"],
+            total_records=result["total_records"],
+            successful=result["successful"],
+            failed=result["failed"],
+            errors=result["errors"],
+            latency_ms=round(latency_ms, 2),
+            model_version="kd-ml-v1",
+        )
+
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Prediction timed out after 120s for {len(request.items)} records",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"KD ML prediction error: {str(e)}")

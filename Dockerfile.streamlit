@@ -24,6 +24,8 @@ COPY .streamlit/ /app/.streamlit/
 COPY models/2024/ /app/models/2024/
 COPY models/2025/ /app/models/2025/
 COPY models/2year/ /app/models/2year/
+# Copy KD ML distribution models (KNN + XGBoost, ~12MB)
+COPY models/kd_distribution/ /app/models/kd_distribution/
 # Multi_output: reassemble split parts into single file
 COPY models/multi_output/baseline_yield_model.part_* /app/models/multi_output/
 COPY models/multi_output/training_template.joblib /app/models/multi_output/

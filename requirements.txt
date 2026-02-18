@@ -21,5 +21,8 @@ plotly>=5.18.0
 matplotlib>=3.8.2
 seaborn>=0.13.1
 
+# HTTP requests
+requests>=2.31.0
+
 # Jupyter support (excluded for Cloud Foundry deployment)
 # ipykernel

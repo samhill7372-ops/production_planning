@@ -178,3 +178,98 @@ class MultiOutputResponse(BaseModel):
     model_version: str = Field(..., description="Model version identifier")
     records_received: Optional[int] = Field(None, description="Total input records received")
     records_processed: Optional[int] = Field(None, description="Records after 261 movement type filter")
+
+
+# ============== KD ML Distribution Prediction ==============
+
+class KDMLPredictionItem(BaseModel):
+    """Single tally record for KD ML distribution prediction.
+
+    Records with the same manufacturing_order are grouped together and
+    processed as one order (matching Streamlit CSV upload behavior).
+    """
+    manufacturing_order: str = Field("ORDER_0001", description="Manufacturing order number. Records with the same value are grouped as one order.")
+    material: str = Field(..., description="Input KS material code")
+    species: str = Field(..., description="Wood species code")
+    thickness: float = Field(..., description="Material thickness in inches")
+    plant: str = Field(..., description="Plant code")
+    tallygrade: str = Field(..., description="Tally grade")
+    tallylength: float = Field(..., description="Tally length in inches")
+    tallywidth: float = Field(..., description="Tally width in inches")
+    bfin: float = Field(..., gt=0, description="Board feet input")
+    posting_date: Optional[str] = Field(None, description="Posting date (metadata only, not used in prediction)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "manufacturing_order": "1078021",
+                "material": "4RO3BKS",
+                "species": "RO",
+                "thickness": 4,
+                "plant": "1M10",
+                "tallygrade": "PR",
+                "tallylength": 119,
+                "tallywidth": 72,
+                "bfin": 2255,
+                "posting_date": "2025-06-15"
+            }
+        }
+
+
+class KDMLPredictionRequest(BaseModel):
+    """Bulk prediction request: array of tally records.
+
+    Records are grouped by manufacturing_order. Each group produces one
+    prediction result, using all tally rows together for feature engineering
+    (matching how the Streamlit CSV upload works).
+    """
+    items: List[KDMLPredictionItem] = Field(..., min_length=1, max_length=10000, description="List of tally records for prediction")
+
+    @model_validator(mode="after")
+    def validate_items(self):
+        if not self.items:
+            raise ValueError("At least one tally record is required")
+        return self
+
+
+class KDMLOutputMaterial(BaseModel):
+    """Single output material in the KD distribution."""
+    output_material: str = Field(..., description="KD output material code")
+    distribution_pct: float = Field(..., description="Distribution percentage")
+    cumulative_pct: float = Field(..., description="Cumulative distribution percentage")
+    expected_output_bf: float = Field(..., description="Expected output board feet")
+    material_yield_pct: float = Field(..., description="Material yield percentage")
+    historical_orders: int = Field(..., description="Number of historical orders")
+
+
+class KDMLOrderResult(BaseModel):
+    """Prediction result for one manufacturing order."""
+    manufacturing_order: str = Field(..., description="Manufacturing order number")
+    material: str = Field(..., description="Input KS material code")
+    total_bfin: float = Field(..., description="Total input board feet (summed across all tally rows)")
+    num_tally_rows: int = Field(..., description="Number of tally rows in this order")
+    predicted_yield_pct: float = Field(..., description="Predicted yield percentage")
+    predicted_output_bf: float = Field(..., description="Predicted output board feet")
+    search_mode: str = Field(..., description="KNN search mode used")
+    n_neighbors_used: int = Field(..., description="Number of KNN neighbors used")
+    avg_neighbor_distance: float = Field(..., description="Average KNN neighbor distance")
+    kd_count: int = Field(..., description="Number of KD materials in distribution")
+    distribution: List[KDMLOutputMaterial] = Field(..., description="KD material distribution")
+
+
+class KDMLErrorItem(BaseModel):
+    """Error details for a failed order prediction."""
+    manufacturing_order: str = Field(..., description="Manufacturing order number")
+    error: str = Field(..., description="Error message")
+
+
+class KDMLPredictionResponse(BaseModel):
+    """Bulk KD ML prediction response — one result per manufacturing order."""
+    results: List[KDMLOrderResult] = Field(..., description="Per-order prediction results")
+    num_orders: int = Field(..., description="Number of manufacturing orders processed")
+    total_records: int = Field(..., description="Total tally records received")
+    successful: int = Field(..., description="Number of successful order predictions")
+    failed: int = Field(..., description="Number of failed order predictions")
+    errors: List[KDMLErrorItem] = Field(default_factory=list, description="Error details for failed orders")
+    latency_ms: float = Field(..., description="Processing latency in milliseconds")
+    model_version: str = Field(..., description="Model version identifier")
