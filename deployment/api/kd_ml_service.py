@@ -313,23 +313,13 @@ class KDMLDistributionService:
             mat_name = col[3:] if col.startswith("KD_") else col
             if col == "KD_OTHER":
                 mat_name = "Other Materials (rare KD combined)"
-            dist_pct = round(float(ratio) * 100, 2)
             rows.append({
-                "output_material": mat_name,
-                "distribution_pct": dist_pct,
-                "expected_output_bf": round(float(bf), 2),
-                "material_yield_pct": round(float(bf) / total_bfin * 100, 2) if total_bfin > 0 else 0.0,
-                "historical_orders": hist_counts.get(col, 0),
+                "material": mat_name,
+                "bfout": round(float(bf), 2),
             })
 
-        # Sort by expected_output_bf descending
-        rows.sort(key=lambda r: r["expected_output_bf"], reverse=True)
-
-        # Add cumulative %
-        cum = 0.0
-        for r in rows:
-            cum += r["distribution_pct"]
-            r["cumulative_pct"] = round(cum, 2)
+        # Sort by bfout descending
+        rows.sort(key=lambda r: r["bfout"], reverse=True)
 
         return {
             "manufacturing_order": order_id,

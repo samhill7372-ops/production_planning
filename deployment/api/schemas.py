@@ -234,12 +234,8 @@ class KDMLPredictionRequest(BaseModel):
 
 class KDMLOutputMaterial(BaseModel):
     """Single output material in the KD distribution."""
-    output_material: str = Field(..., description="KD output material code")
-    distribution_pct: float = Field(..., description="Distribution percentage")
-    cumulative_pct: float = Field(..., description="Cumulative distribution percentage")
-    expected_output_bf: float = Field(..., description="Expected output board feet")
-    material_yield_pct: float = Field(..., description="Material yield percentage")
-    historical_orders: int = Field(..., description="Number of historical orders")
+    material: str = Field(..., description="KD output material code")
+    bfout: float = Field(..., description="Expected output board feet")
 
 
 class KDMLOrderResult(BaseModel):
