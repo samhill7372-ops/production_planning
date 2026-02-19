@@ -233,7 +233,7 @@ class KDMLPredictionRequest(BaseModel):
 
 
 class KDMLOutputMaterial(BaseModel):
-    """Single output material in the KD distribution."""
+    """Single output material in the KD distribution — V2.1 simplified."""
     material: str = Field(..., description="KD output material code")
     bfout: float = Field(..., description="Expected output board feet")
 
