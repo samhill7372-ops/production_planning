@@ -2002,6 +2002,8 @@ def render_test2_ml_only_section(
                         'result_df': result_df,
                         'summary': summary,
                     }
+                    st.session_state.t2_original_result_df = result_df.copy()
+                    st.session_state.t2_exclude_selection = []
                 else:
                     if model is None:
                         st.error("Yield model not available.")
@@ -2265,6 +2267,59 @@ def render_test2_ml_only_section(
         st.subheader("Output Material Distribution")
         st.dataframe(result_df, use_container_width=True, hide_index=True)
 
+        # --- Material Exclusion (single prediction only) ---
+        if not is_batch:
+            orig_df = st.session_state.get("t2_original_result_df")
+            total_output = summary.get("predicted_output", 0)
+            total_bfin_val = summary.get("total_bfin", 0)
+
+            if orig_df is not None and len(orig_df) > 0:
+                st.markdown("---")
+                st.subheader("Exclude Materials")
+                exclude_sel = st.multiselect(
+                    "Select materials to exclude (their BF redistributed equally among remaining):",
+                    options=orig_df["Output Material"].tolist(),
+                    default=st.session_state.get("t2_exclude_selection", []),
+                    key="t2_exclude_widget",
+                )
+                col_ex1, col_ex2 = st.columns(2)
+                with col_ex1:
+                    apply_clicked = st.button(
+                        "Apply Exclusion", key="t2_apply_excl",
+                        type="primary", use_container_width=True
+                    )
+                with col_ex2:
+                    reset_clicked = st.button(
+                        "Reset to Original", key="t2_reset_excl",
+                        use_container_width=True
+                    )
+
+                if apply_clicked and exclude_sel:
+                    st.session_state.t2_exclude_selection = exclude_sel
+                    excl_mask = orig_df["Output Material"].isin(exclude_sel)
+                    excluded_share = orig_df.loc[excl_mask, "Distribution %"].sum()
+                    remaining = orig_df[~excl_mask].copy()
+                    n = len(remaining)
+                    if n > 0:
+                        per_mat_boost = excluded_share / n
+                        remaining["Distribution %"] = (remaining["Distribution %"] + per_mat_boost).round(2)
+                        remaining["Expected Output BF"] = ((remaining["Distribution %"] / 100) * total_output).round(2)
+                        remaining["Material Yield %"] = (
+                            (remaining["Expected Output BF"] / total_bfin_val * 100).round(2)
+                            if total_bfin_val > 0 else 0.0
+                        )
+                        remaining = remaining.sort_values("Expected Output BF", ascending=False).reset_index(drop=True)
+                        remaining["Cumulative %"] = remaining["Distribution %"].cumsum().round(2)
+                        st.session_state.t2_result["result_df"] = remaining
+                        st.session_state.t2_result["summary"]["kd_count"] = len(remaining)
+                        st.rerun()
+
+                if reset_clicked:
+                    st.session_state.t2_exclude_selection = []
+                    st.session_state.t2_result["result_df"] = orig_df.copy()
+                    st.session_state.t2_result["summary"]["kd_count"] = len(orig_df)
+                    st.rerun()
+
         # Export
         export_df = result_df.copy()
         if not is_batch:
@@ -2286,6 +2341,46 @@ def render_test2_ml_only_section(
             mime="text/csv",
             key="t2_download"
         )
+
+
+def apply_v22_distribution_rules(result_df: pd.DataFrame) -> pd.DataFrame:
+    """Apply NKD→KD merge and 3BKD exclusion to V2.2 nested distribution data."""
+    new_rows = []
+    for _, row in result_df.iterrows():
+        row_dict = row.to_dict()
+        dist = row_dict.get("distribution", [])
+        if not isinstance(dist, list):
+            new_rows.append(row_dict)
+            continue
+
+        # Step 1: NKD → KD merge (transfer bfout to KD counterpart)
+        bf_map = {}
+        for d in dist:
+            if not isinstance(d, dict):
+                continue
+            mat = d.get("material", "")
+            bf_map[mat] = bf_map.get(mat, 0) + d.get("bfout", 0)
+
+        merged = {}
+        for mat, bf in bf_map.items():
+            if mat.endswith("NKD"):
+                target = mat[:-3] + "KD"
+                merged[target] = merged.get(target, 0) + bf
+            else:
+                merged[mat] = merged.get(mat, 0) + bf
+
+        # Step 2: 3BKD exclusion with proportional redistribution
+        excluded_bf = sum(bf for mat, bf in merged.items() if "3BKD" in mat)
+        kept = {mat: bf for mat, bf in merged.items() if "3BKD" not in mat}
+        remaining_total = sum(kept.values())
+        if excluded_bf > 0 and remaining_total > 0:
+            scale = (remaining_total + excluded_bf) / remaining_total
+            kept = {mat: round(bf * scale, 2) for mat, bf in kept.items()}
+
+        row_dict["distribution"] = [{"material": mat, "bfout": bf} for mat, bf in kept.items()]
+        row_dict["kd_count"] = len(kept)
+        new_rows.append(row_dict)
+    return pd.DataFrame(new_rows)
 
 
 def render_final_v2_section():
@@ -2507,6 +2602,10 @@ def render_final_v2_section():
                 result_df = pd.DataFrame([api_response])
         elif isinstance(api_response, list):
             result_df = pd.DataFrame(api_response)
+
+        # Apply NKD→KD merge and 3BKD exclusion to distribution data
+        if result_df is not None and not result_df.empty and "distribution" in result_df.columns:
+            result_df = apply_v22_distribution_rules(result_df)
 
         if result_df is not None and not result_df.empty:
             col1, col2, col3 = st.columns(3)

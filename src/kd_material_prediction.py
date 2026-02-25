@@ -353,6 +353,22 @@ def predict_kd_distribution(
             kd_ratios, material_history, ks_material, kd_cols
         )
 
+    # --- Permanently exclude all 3BKD grade materials ---
+    for idx, col in enumerate(kd_cols):
+        if "3BKD" in col:
+            kd_ratios[:, idx] = 0.0
+    kd_ratios = normalize_ratios(kd_ratios)
+
+    # --- Merge NKD material quantities into their KD counterparts ---
+    for idx, col in enumerate(kd_cols):
+        if col.endswith("NKD"):
+            kd_counterpart = col[:-3] + "KD"  # e.g. KD_4ROPRNKD → KD_4ROPRKD
+            if kd_counterpart in kd_cols:
+                kd_idx = kd_cols.index(kd_counterpart)
+                kd_ratios[:, kd_idx] += kd_ratios[:, idx]
+            kd_ratios[:, idx] = 0.0
+    # No renormalize needed — transfer preserves the total sum
+
     # --- Optionally remove KD_OTHER and renormalize ---
     exclude_other = kwargs.get("exclude_other", False)
     other_idx = None
