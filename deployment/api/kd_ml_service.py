@@ -138,15 +138,28 @@ def normalize_ratios(y_pred: np.ndarray) -> np.ndarray:
 
 def apply_input_material_guardrail(
     ratios: np.ndarray,
-    material_history: Dict[str, set],
+    material_history: Dict,
     ks_material: str,
     kd_cols: List[str],
+    plant: Optional[str] = None,
 ) -> np.ndarray:
-    """Zero out KD materials never historically produced from this KS material."""
-    if material_history is None or ks_material not in material_history:
+    """Zero out KD materials never historically produced from this KS material.
+
+    Looks up (ks_material, plant) first for plant-specific filtering,
+    then falls back to ks_material alone (global) if no plant-specific entry.
+    """
+    if material_history is None:
         return ratios
 
-    allowed_kd = material_history[ks_material]
+    allowed_kd = None
+    if plant and (ks_material, plant) in material_history:
+        allowed_kd = material_history[(ks_material, plant)]
+    elif ks_material in material_history:
+        allowed_kd = material_history[ks_material]
+
+    if allowed_kd is None:
+        return ratios
+
     adjusted = ratios.copy()
     for idx, col in enumerate(kd_cols):
         mat_code = col[3:] if col.startswith("KD_") else col
@@ -281,9 +294,47 @@ class KDMLDistributionService:
 
         # --- Apply material guardrail ---
         if apply_guardrail and self.material_history is not None:
+            plant = str(df_261_rows["PLANT"].iloc[0]) if "PLANT" in df_261_rows.columns else None
             kd_ratios = apply_input_material_guardrail(
-                kd_ratios, self.material_history, ks_material, self.kd_cols
+                kd_ratios, self.material_history, ks_material, self.kd_cols, plant=plant
             )
+
+        # --- Permanently exclude all 3BKD grade materials ---
+        for idx, col in enumerate(self.kd_cols):
+            if "3BKD" in col:
+                kd_ratios[:, idx] = 0.0
+        kd_ratios = normalize_ratios(kd_ratios)
+
+        # --- Merge NKD material quantities into their KD counterparts ---
+        for idx, col in enumerate(self.kd_cols):
+            if col.endswith("NKD"):
+                kd_counterpart = col[:-3] + "KD"
+                if kd_counterpart in self.kd_cols:
+                    kd_idx = self.kd_cols.index(kd_counterpart)
+                    kd_ratios[:, kd_idx] += kd_ratios[:, idx]
+                kd_ratios[:, idx] = 0.0
+
+        # --- Merge S2/S2E1/S2E2 materials into parent (strip S2 + truncate after KD) ---
+        s2_orphans = {}
+        for idx, col in enumerate(self.kd_cols):
+            mat = col[3:] if col.startswith("KD_") else col
+            parent = mat
+            for pattern in ["S2E1", "S2E2", "S2"]:
+                if pattern in parent:
+                    parent = parent.replace(pattern, "", 1)
+                    break
+            if parent == mat:
+                continue
+            kd_pos = parent.find("KD")
+            if kd_pos >= 0:
+                parent = parent[:kd_pos + 2]
+            parent_col = f"KD_{parent}" if col.startswith("KD_") else parent
+            if parent_col in self.kd_cols:
+                parent_idx = self.kd_cols.index(parent_col)
+                kd_ratios[:, parent_idx] += kd_ratios[:, idx]
+            else:
+                s2_orphans[parent] = s2_orphans.get(parent, 0) + float(kd_ratios[0, idx])
+            kd_ratios[:, idx] = 0.0
 
         # --- Optionally remove KD_OTHER ---
         if exclude_other:
@@ -316,6 +367,15 @@ class KDMLDistributionService:
             rows.append({
                 "material": mat_name,
                 "bfout": round(float(bf), 2),
+            })
+
+        # --- Add orphaned S2 parent materials not in training columns ---
+        for parent_name, orphan_ratio in s2_orphans.items():
+            if orphan_ratio < 0.005:
+                continue
+            rows.append({
+                "material": parent_name,
+                "bfout": round(float(orphan_ratio * total_output), 2),
             })
 
         # Sort by bfout descending

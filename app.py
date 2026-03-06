@@ -1862,7 +1862,17 @@ def render_test2_ml_only_section(
     kd_model_artifacts=None,
 ):
     """Render V2.1: ML-only KD material distribution prediction."""
+    import re
     from src.kd_material_prediction import predict_kd_distribution
+
+    def parse_material_code(material_code: str):
+        """Extract thickness and species from a material code.
+        E.g. '4RO3BKS' -> (4.0, 'RO'), '10SM3BKS' -> (10.0, 'SM').
+        """
+        m = re.match(r'^(\d+)([A-Z]{2})', str(material_code).upper())
+        if m:
+            return float(m.group(1)), m.group(2)
+        return None, None
 
     use_kd_model = kd_model_artifacts is not None
 
@@ -1908,11 +1918,26 @@ def render_test2_ml_only_section(
                 key="t2_material"
             )
 
-            specie_options = options.get('Input_Specie', ['SM'])
-            selected_specie = st.selectbox("Specie *", options=specie_options, key="t2_specie")
+            # Auto-detect Species and Thickness from material code
+            detected_thickness, detected_specie = parse_material_code(selected_material)
+            input_thickness = detected_thickness if detected_thickness else 4.0
 
-            grade_options = options.get('Input_Grade', ['2C'])
-            selected_grade = st.selectbox("Grade *", options=grade_options, key="t2_grade")
+            mat_specie_map = options.get('Material_Specie_Map', {})
+            if selected_material in mat_specie_map:
+                selected_specie = mat_specie_map[selected_material]
+            else:
+                specie_options = options.get('Input_Specie', [])
+                selected_specie = detected_specie if detected_specie else "SM"
+                if detected_specie:
+                    for sp in specie_options:
+                        if sp.upper().startswith(detected_specie.upper()) and len(sp) > len(detected_specie):
+                            selected_specie = sp
+                            break
+
+            st.session_state["t2_specie_display"] = selected_specie
+            st.text_input("Specie (auto-detected)", disabled=True, key="t2_specie_display")
+            st.session_state["t2_thickness_display"] = str(input_thickness)
+            st.text_input("Thickness (auto-detected)", disabled=True, key="t2_thickness_display")
 
         with col2:
             input_bf = st.number_input(
@@ -1923,14 +1948,6 @@ def render_test2_ml_only_section(
                 step=1000.0,
                 key="t2_bfin"
             )
-            input_thickness = st.number_input(
-                "Thickness *",
-                min_value=0.0,
-                max_value=100.0,
-                value=4.0,
-                step=0.1,
-                key="t2_thickness"
-            )
             input_width = st.number_input(
                 "Width *",
                 min_value=0.0,
@@ -1939,19 +1956,6 @@ def render_test2_ml_only_section(
                 step=0.1,
                 key="t2_width"
             )
-            limit_historical = st.checkbox(
-                "Limit to historically seen outputs for this input material",
-                value=True,
-                key="t2_hist_only"
-            )
-            if use_kd_model:
-                exclude_other = st.checkbox(
-                    "Redistribute 'Other' across named materials",
-                    value=False,
-                    key="t2_exclude_other",
-                    help="Removes the catch-all 'Other Materials' bucket and spreads its BF across the named KD materials."
-                )
-
             # Legacy classifier controls
             if not use_kd_model:
                 top_k = st.slider("Top related outputs", min_value=3, max_value=10, value=5, step=1, key="t2_top_k")
@@ -1973,7 +1977,7 @@ def render_test2_ml_only_section(
                 'Input_Material': selected_material,
                 'Input_Thickness': input_thickness,
                 'Input_Specie': selected_specie,
-                'Input_Grade': selected_grade,
+                'Input_Grade': "",
                 'Input_Width': input_width,
                 'Total_Input_BF': input_bf,
                 'Input_Length': 96.0,
@@ -2117,21 +2121,6 @@ def render_test2_ml_only_section(
             preview_df = order_agg[["MANUFACTURINGORDER", "Material", "Total_BFIN", "Rows"]].copy()
             preview_df.columns = ["Order", "Input Material", "Total Input BF", "Rows"]
             st.dataframe(preview_df, use_container_width=True, hide_index=True)
-
-            # Options
-            col_opt1, col_opt2 = st.columns(2)
-            with col_opt1:
-                limit_historical = st.checkbox(
-                    "Limit to historically seen outputs",
-                    value=True,
-                    key="t2_upload_hist_only"
-                )
-            with col_opt2:
-                exclude_other = st.checkbox(
-                    "Redistribute 'Other' across named materials",
-                    value=False,
-                    key="t2_upload_exclude_other",
-                )
 
             st.markdown("---")
 
@@ -2344,7 +2333,7 @@ def render_test2_ml_only_section(
 
 
 def apply_v22_distribution_rules(result_df: pd.DataFrame) -> pd.DataFrame:
-    """Apply NKD→KD merge and 3BKD exclusion to V2.2 nested distribution data."""
+    """Apply NKD→KD merge, S2→parent merge, 3BKD exclusion to V2.2 nested distribution data."""
     new_rows = []
     for _, row in result_df.iterrows():
         row_dict = row.to_dict()
@@ -2368,6 +2357,21 @@ def apply_v22_distribution_rules(result_df: pd.DataFrame) -> pd.DataFrame:
                 merged[target] = merged.get(target, 0) + bf
             else:
                 merged[mat] = merged.get(mat, 0) + bf
+
+        # Step 1b: S2/S2E1/S2E2 → parent merge (strip S2 + truncate after KD)
+        s2_merged = {}
+        for mat, bf in merged.items():
+            parent = mat
+            for pattern in ["S2E1", "S2E2", "S2"]:
+                if pattern in parent:
+                    parent = parent.replace(pattern, "", 1)
+                    break
+            if parent != mat:
+                kd_pos = parent.find("KD")
+                if kd_pos >= 0:
+                    parent = parent[:kd_pos + 2]
+            s2_merged[parent] = s2_merged.get(parent, 0) + bf
+        merged = s2_merged
 
         # Step 2: 3BKD exclusion with proportional redistribution
         excluded_bf = sum(bf for mat, bf in merged.items() if "3BKD" in mat)

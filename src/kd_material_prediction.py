@@ -148,15 +148,29 @@ def build_kd_training_matrix(
 
 def apply_input_material_guardrail(
     ratios: np.ndarray,
-    material_history: Dict[str, set],
+    material_history: Dict,
     ks_material: str,
     kd_cols: List[str],
+    plant: Optional[str] = None,
 ) -> np.ndarray:
-    """Zero out KD materials never historically produced from this KS material."""
-    if material_history is None or ks_material not in material_history:
+    """Zero out KD materials never historically produced from this KS material.
+
+    Looks up (ks_material, plant) first for plant-specific filtering,
+    then falls back to ks_material alone (global) if no plant-specific entry.
+    """
+    if material_history is None:
         return ratios
 
-    allowed_kd = material_history[ks_material]
+    # Plant-specific lookup first, then global fallback
+    allowed_kd = None
+    if plant and (ks_material, plant) in material_history:
+        allowed_kd = material_history[(ks_material, plant)]
+    elif ks_material in material_history:
+        allowed_kd = material_history[ks_material]
+
+    if allowed_kd is None:
+        return ratios
+
     adjusted = ratios.copy()
     for idx, col in enumerate(kd_cols):
         mat_code = col[3:] if col.startswith("KD_") else col
@@ -173,12 +187,19 @@ def apply_input_material_guardrail(
 
 def build_material_history(
     df_261: pd.DataFrame, df_101: pd.DataFrame
-) -> Dict[str, set]:
-    """Build mapping: {KS_material -> set of KD materials historically produced}."""
+) -> Dict:
+    """Build plant-aware material history mapping.
+
+    Returns a dict with two key types:
+      - (ks_material, plant) -> set of KD materials for that plant
+      - ks_material -> set of KD materials globally (fallback)
+    """
     order_col = "MANUFACTURINGORDER"
 
-    input_mat = (
-        df_261.groupby(order_col)["MATERIAL"].first().rename("KS_MATERIAL")
+    # Get input material and plant per order
+    input_info = df_261.groupby(order_col).agg(
+        KS_MATERIAL=("MATERIAL", "first"),
+        PLANT=("PLANT", "first"),
     )
     output_mats = (
         df_101.groupby(order_col)["MATERIAL"]
@@ -186,17 +207,28 @@ def build_material_history(
         .rename("KD_MATERIALS")
     )
 
-    merged = pd.DataFrame({"KS_MATERIAL": input_mat, "KD_MATERIALS": output_mats}).dropna()
+    merged = input_info.join(output_mats, how="inner").dropna()
 
-    history: Dict[str, set] = {}
+    history: Dict = {}
     for _, row in merged.iterrows():
         ks = str(row["KS_MATERIAL"])
-        kds = row["KD_MATERIALS"]
+        plant = str(row["PLANT"])
+        kds = {str(m) for m in row["KD_MATERIALS"]}
+
+        # Plant-specific entry
+        key = (ks, plant)
+        if key not in history:
+            history[key] = set()
+        history[key].update(kds)
+
+        # Global fallback entry
         if ks not in history:
             history[ks] = set()
-        history[ks].update(str(m) for m in kds)
+        history[ks].update(kds)
 
-    print(f"Material history: {len(history)} KS materials mapped to KD outputs")
+    n_plant_keys = sum(1 for k in history if isinstance(k, tuple))
+    n_global_keys = sum(1 for k in history if isinstance(k, str))
+    print(f"Material history: {n_plant_keys} (material, plant) pairs + {n_global_keys} global materials")
     return history
 
 
@@ -349,8 +381,9 @@ def predict_kd_distribution(
 
     # --- Apply material guardrail ---
     if apply_material_guardrail and material_history is not None:
+        plant = input_data.get('Input_Plant')
         kd_ratios = apply_input_material_guardrail(
-            kd_ratios, material_history, ks_material, kd_cols
+            kd_ratios, material_history, ks_material, kd_cols, plant=plant
         )
 
     # --- Permanently exclude all 3BKD grade materials ---
@@ -368,6 +401,29 @@ def predict_kd_distribution(
                 kd_ratios[:, kd_idx] += kd_ratios[:, idx]
             kd_ratios[:, idx] = 0.0
     # No renormalize needed — transfer preserves the total sum
+
+    # --- Merge S2/S2E1/S2E2 materials into parent (strip S2 pattern + truncate after KD) ---
+    s2_orphans = {}  # {parent_name: ratio} for parents not in kd_cols
+    for idx, col in enumerate(kd_cols):
+        mat = col[3:] if col.startswith("KD_") else col
+        parent = mat
+        for pattern in ["S2E1", "S2E2", "S2"]:
+            if pattern in parent:
+                parent = parent.replace(pattern, "", 1)
+                break
+        if parent == mat:
+            continue  # not an S2 material
+        # Truncate after "KD" to get base parent
+        kd_pos = parent.find("KD")
+        if kd_pos >= 0:
+            parent = parent[:kd_pos + 2]  # keep up to and including "KD"
+        parent_col = f"KD_{parent}" if col.startswith("KD_") else parent
+        if parent_col in kd_cols:
+            parent_idx = kd_cols.index(parent_col)
+            kd_ratios[:, parent_idx] += kd_ratios[:, idx]
+        else:
+            s2_orphans[parent] = s2_orphans.get(parent, 0) + float(kd_ratios[0, idx])
+        kd_ratios[:, idx] = 0.0
 
     # --- Optionally remove KD_OTHER and renormalize ---
     exclude_other = kwargs.get("exclude_other", False)
@@ -408,6 +464,22 @@ def predict_kd_distribution(
                 "Expected Output BF": round(float(bf), 2),
                 "Material Yield %": round(float(bf) / total_bfin * 100, 2) if total_bfin > 0 else 0.0,
                 "Historical Orders": hist_counts.get(col, 0),
+            }
+        )
+
+    # --- Add orphaned S2 parent materials not in training columns ---
+    for parent_name, orphan_ratio in s2_orphans.items():
+        if orphan_ratio < 0.005:
+            continue
+        orphan_bf = orphan_ratio * total_output
+        rows.append(
+            {
+                "Output Material": parent_name,
+                "Input BF": round(total_bfin, 2),
+                "Distribution %": round(float(orphan_ratio) * 100, 2),
+                "Expected Output BF": round(float(orphan_bf), 2),
+                "Material Yield %": round(float(orphan_bf) / total_bfin * 100, 2) if total_bfin > 0 else 0.0,
+                "Historical Orders": 0,
             }
         )
 

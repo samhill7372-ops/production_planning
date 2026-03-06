@@ -1,0 +1,47 @@
+# Training Configuration: KD Material Distribution Model
+# Two-stage XGBoost: yield factor + KD material ratio distribution
+
+model_name: kd-distribution
+description: "KD Material Distribution - Two-Stage XGBoost"
+model_type: kd_distribution
+
+# Data sources
+data:
+  years: ["2024", "2025"]
+  min_order_threshold: 5  # KD materials with >= N orders get own column, rest go to KD_OTHER
+
+# Model configuration
+model:
+  yield:
+    algorithm: XGBRegressor
+    hyperparameters:
+      n_estimators: 200
+      max_depth: 8
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 3
+      random_state: 42
+  ratio:
+    algorithm: MultiOutputRegressor_XGBRegressor
+    hyperparameters:
+      n_estimators: 200
+      max_depth: 6
+      learning_rate: 0.05
+      subsample: 0.8
+      min_child_weight: 5
+      random_state: 42
+
+# Output paths
+output:
+  model_dir: models/kd_distribution/
+  artifacts:
+    - kd_model_bundle.joblib
+    - kd_training_template.joblib
+    - kd_material_history.joblib
+    - model_metadata.json
+
+# Validation
+validation:
+  test_size: 0.2
+  cross_validation_folds: 5

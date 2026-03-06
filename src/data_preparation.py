@@ -643,6 +643,16 @@ def get_unique_materials_from_csv(
                 if 'MATERIALTHICKNESS' in df_261.columns:
                     result['Input_Thickness'] = sorted(df_261['MATERIALTHICKNESS'].dropna().unique().tolist())
 
+                # Build material → species mapping (most common species per material)
+                if 'MATERIAL' in df_261.columns and 'MATERIALSPECIE' in df_261.columns:
+                    mat_specie_map = (
+                        df_261.dropna(subset=['MATERIAL', 'MATERIALSPECIE'])
+                        .groupby('MATERIAL')['MATERIALSPECIE']
+                        .agg(lambda x: x.mode().iloc[0] if len(x) > 0 else '')
+                        .to_dict()
+                    )
+                    result['Material_Specie_Map'] = {str(k): str(v) for k, v in mat_specie_map.items()}
+
                 del df_261  # Free memory
 
         # Load 101 for OUTPUT materials (Goods Receipt - finished goods produced)
