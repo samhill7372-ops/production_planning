@@ -4,8 +4,10 @@ import os
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
+
+from auth import verify_credentials
 
 from schemas import (
     PredictionRequest, PredictionResponse, HealthResponse, ErrorResponse,
@@ -159,10 +161,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Authenticated router — all routes except /health require Basic Auth
+auth_router = APIRouter(dependencies=[Depends(verify_credentials)])
+
 
 # ============== Yield Prediction ==============
 
-@app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
+@auth_router.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
 async def predict(
     request: PredictionRequest,
     model_year: str = Query("2024", description="Model year: 2024, 2025, or 2year"),
@@ -213,7 +218,7 @@ async def health():
     )
 
 
-@app.get("/", tags=["Info"])
+@auth_router.get("/", tags=["Info"])
 async def root():
     """Root endpoint with API info."""
     return {
@@ -227,7 +232,7 @@ async def root():
     }
 
 
-@app.get("/models", tags=["Info"])
+@auth_router.get("/models", tags=["Info"])
 async def list_models():
     """List all available model years and capabilities."""
     return {
@@ -237,7 +242,7 @@ async def list_models():
     }
 
 
-@app.get("/valid-values/{field}", tags=["Info"])
+@auth_router.get("/valid-values/{field}", tags=["Info"])
 async def get_valid_values(
     field: str,
     model_year: str = Query("2024", description="Model year"),
@@ -263,7 +268,7 @@ async def get_valid_values(
 
 # ============== KD Distribution Prediction ==============
 
-@app.post("/predict-kd", response_model=KDPredictionResponse, tags=["KD Prediction"])
+@auth_router.post("/predict-kd", response_model=KDPredictionResponse, tags=["KD Prediction"])
 async def predict_kd(
     request: KDPredictionRequest,
     model_year: str = Query("2024", description="Model year: 2024, 2025, or 2year"),
@@ -305,7 +310,7 @@ async def predict_kd(
         raise HTTPException(status_code=500, detail=f"KD prediction error: {str(e)}")
 
 
-@app.get("/kd-materials", tags=["KD Prediction"])
+@auth_router.get("/kd-materials", tags=["KD Prediction"])
 async def list_kd_materials(
     model_year: str = Query("2024", description="Model year"),
 ):
@@ -315,7 +320,7 @@ async def list_kd_materials(
     return {"model_year": model_year, "materials": materials, "count": len(materials)}
 
 
-@app.get("/kd-plants/{material}", tags=["KD Prediction"])
+@auth_router.get("/kd-plants/{material}", tags=["KD Prediction"])
 async def list_kd_plants(
     material: str,
     model_year: str = Query("2024", description="Model year"),
@@ -332,7 +337,7 @@ async def list_kd_plants(
 
 # ============== Multi-Output Prediction ==============
 
-@app.post("/predict-multi-output", response_model=MultiOutputResponse, tags=["Multi-Output Prediction"])
+@auth_router.post("/predict-multi-output", response_model=MultiOutputResponse, tags=["Multi-Output Prediction"])
 async def predict_multi_output(request: MultiOutputRequest):
     """
     Predict output board distribution from 261 consumption tally records.
@@ -389,7 +394,7 @@ async def predict_multi_output(request: MultiOutputRequest):
 
 # ============== KD ML Distribution Prediction ==============
 
-@app.post("/predict-kd-ml", response_model=KDMLPredictionResponse, tags=["KD ML Prediction"])
+@auth_router.post("/predict-kd-ml", response_model=KDMLPredictionResponse, tags=["KD ML Prediction"])
 async def predict_kd_ml(request: KDMLPredictionRequest):
     """
     Predict KD material distribution using ML model (KNN + XGBoost).
@@ -439,3 +444,7 @@ async def predict_kd_ml(request: KDMLPredictionRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"KD ML prediction error: {str(e)}")
+
+
+# Register all authenticated routes
+app.include_router(auth_router)

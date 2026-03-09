@@ -11,8 +11,11 @@ import os
 import pandas as pd
 import plotly.express as px
 
-# API URL from environment variable
+# API URL and auth from environment variables
 API_URL = os.getenv("API_URL", "http://localhost:8000")
+_api_user = os.getenv("API_USERNAME", "")
+_api_pass = os.getenv("API_PASSWORD", "")
+API_AUTH = (_api_user, _api_pass) if _api_user else None
 
 st.set_page_config(
     page_title="Yield Prediction API Tester",
@@ -27,7 +30,7 @@ st.caption(f"Connected to: `{API_URL}`")
 # Health Check
 def check_health():
     try:
-        response = requests.get(f"{API_URL}/health", timeout=5)
+        response = requests.get(f"{API_URL}/health", timeout=5, auth=API_AUTH)
         return response.json()
     except Exception as e:
         return {"error": str(e)}
@@ -47,7 +50,7 @@ with st.sidebar:
     st.divider()
     st.header("Model Info")
     try:
-        info = requests.get(f"{API_URL}/model/info", timeout=5).json()
+        info = requests.get(f"{API_URL}/model/info", timeout=5, auth=API_AUTH).json()
         st.write(f"**Model Year:** {info.get('model_year', 'N/A')}")
         st.write(f"**Features:** {info.get('num_features', 'N/A')}")
     except:
@@ -82,7 +85,7 @@ with tab1:
         }
 
         try:
-            response = requests.post(f"{API_URL}/predict/forward", json=payload, timeout=10)
+            response = requests.post(f"{API_URL}/predict/forward", json=payload, timeout=10, auth=API_AUTH)
             result = response.json()
 
             if response.status_code == 200:
@@ -127,7 +130,7 @@ with tab2:
         }
 
         try:
-            response = requests.post(f"{API_URL}/predict/reverse", json=payload, timeout=10)
+            response = requests.post(f"{API_URL}/predict/reverse", json=payload, timeout=10, auth=API_AUTH)
             result = response.json()
 
             if response.status_code == 200:
@@ -161,10 +164,10 @@ with tab3:
         try:
             url = f"{API_URL}{endpoint}"
             if method == "GET":
-                response = requests.get(url, timeout=10)
+                response = requests.get(url, timeout=10, auth=API_AUTH)
             else:
                 import json
-                response = requests.post(url, json=json.loads(body), timeout=10)
+                response = requests.post(url, json=json.loads(body), timeout=10, auth=API_AUTH)
 
             st.write(f"**Status Code:** {response.status_code}")
             st.json(response.json())

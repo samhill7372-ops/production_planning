@@ -12,6 +12,8 @@ services:
       - "8001:8000"
     environment:
       - MODEL_YEAR=2024
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -27,6 +29,8 @@ services:
       - "8501:8501"
     environment:
       - API_URL=http://yield-2024-api:8000
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     depends_on:
       - yield-2024-api
@@ -42,6 +46,8 @@ services:
       - "8002:8000"
     environment:
       - MODEL_YEAR=2025
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -57,6 +63,8 @@ services:
       - "8502:8501"
     environment:
       - API_URL=http://yield-2025-api:8000
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     depends_on:
       - yield-2025-api
@@ -72,6 +80,8 @@ services:
       - "8003:8000"
     environment:
       - MODEL_YEAR=2year
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -89,6 +99,8 @@ services:
       - "8503:8501"
     environment:
       - API_URL=http://yield-2year-api:8000
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     depends_on:
       - yield-2year-api
@@ -106,6 +118,8 @@ services:
       - "8004:8000"
     environment:
       - MODEL_YEAR=5year
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -123,6 +137,8 @@ services:
       - "8504:8501"
     environment:
       - API_URL=http://yield-5year-api:8000
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     depends_on:
       - yield-5year-api
@@ -140,6 +156,8 @@ services:
       - "8005:8000"
     environment:
       - MODEL_YEAR=6month
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -157,6 +175,8 @@ services:
       - "8505:8501"
     environment:
       - API_URL=http://yield-6month-api:8000
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     depends_on:
       - yield-6month-api
@@ -174,6 +194,8 @@ services:
       - "8006:8000"
     environment:
       - MODEL_YEAR=multi
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -191,6 +213,8 @@ services:
       - "8506:8501"
     environment:
       - API_URL=http://yield-multi-api:8000
+      - API_USERNAME=${API_USERNAME}
+      - API_PASSWORD=${API_PASSWORD}
     restart: unless-stopped
     depends_on:
       - yield-multi-api
